@@ -21,6 +21,112 @@ from torchtitan.tools import utils
 from torchtitan.tools.logging import logger
 
 
+def _conversation_to_text(sample: Dict[str, Any]) -> Dict[str, str]:
+    """Flatten a conversation list into a single text field with role prefixes."""
+    conversations = sample.get('conversations')
+    if not isinstance(conversations, list):
+        raise ValueError(f"Expected 'conversations' to be a list, got {type(conversations)}")
+
+    lines = []
+    for turn in conversations:
+        if not isinstance(turn, dict):
+            continue
+        value = turn.get('value')
+        if value is None:
+            continue
+        speaker = turn.get('from')
+        prefix = f"{speaker}: " if speaker else ""
+        lines.append(f"{prefix}{value}")
+
+    if not lines:
+        raise ValueError(f"Sample has empty 'conversations': {sample}")
+
+    metadata = [
+        f"{key}={sample[key]}"
+        for key in ('difficulty', 'source', 'domain')
+        if key in sample and sample[key] not in (None, '')
+    ]
+    text_parts = metadata + lines
+    return {'text': '\n\n'.join(str(part) for part in text_parts)}
+
+
+def _extract_text(sample: Dict[str, Any]) -> str:
+    """Retrieve text/content from sample, supporting raw conversations."""
+    if sample.get('text', None) is not None:
+        return sample['text']
+    if sample.get('content', None) is not None:
+        return sample['content']
+    if sample.get('conversations', None) is not None:
+        return _conversation_to_text(sample)['text']
+    raise ValueError(f"No 'text', 'content', or 'conversations' field found in sample:\n{sample}")
+
+
+def _ensure_text_column(
+    dataset: Union[Dataset, IterableDataset], streaming: bool, num_workers: int
+) -> Union[Dataset, IterableDataset]:
+    """Ensure dataset has a single 'text' column, converting from conversations when needed."""
+    if 'text' in dataset.column_names:
+        return dataset.select_columns('text')
+    if 'content' in dataset.column_names:
+        return dataset.select_columns('content')
+    if 'conversations' in dataset.column_names:
+        use_num_proc = not streaming and not isinstance(dataset, IterableDataset)
+        map_kwargs = {'num_proc': num_workers} if use_num_proc else {}
+        logger.info("Converting 'conversations' column to flattened 'text' for tokenization.")
+        dataset = dataset.map(_conversation_to_text, **map_kwargs)
+        return dataset.select_columns('text')
+    raise ValueError("Dataset has no 'text', 'content', or 'conversations' column")
+
+
+class SampleLevelIterableDataset(IterableDataset):
+    """Iterate per sample without concatenating across samples; long samples are truncated to seq_len."""
+
+    def __init__(
+        self, dataset: Dataset, tokenizer: PreTrainedTokenizer, seq_len: int = 2048, rank: int = 0, world_size: int = 1
+    ) -> SampleLevelIterableDataset:
+        self.dataset = dataset
+        self.tokenizer = tokenizer
+        self.seq_len = seq_len
+        self.rank = rank
+        self.world_size = world_size
+        self.data = dataset.shard(world_size, rank)
+        self.states = None
+
+    def __iter__(self):
+        if self.states is not None:
+            self.data.load_state_dict(self.states)
+
+        for tokenized in self.tokenize(self.data):
+            if len(tokenized) == 0:
+                continue
+            yield {'input_ids': torch.tensor(tokenized[: self.seq_len], dtype=torch.long)}
+
+    def tokenize(self, data, buffer_size: int = 64):
+        buffer, states = [], []
+        for sample in data:
+            buffer.append(_extract_text(sample))
+            states.append(self.data.state_dict())
+            if len(buffer) == buffer_size:
+                for s, tokenized in zip(states, self.tokenizer(buffer, return_attention_mask=False)['input_ids']):
+                    self.states = s
+                    yield tokenized
+                buffer, states = [], []
+        if len(buffer) > 0:
+            for s, tokenized in zip(states, self.tokenizer(buffer, return_attention_mask=False)['input_ids']):
+                self.states = s
+                yield tokenized
+
+    def state_dict(self):
+        return {'states': self.states}
+
+    def load_state_dict(self, state_dict):
+        self.states = state_dict['states']
+
+    def set_epoch(self, epoch):
+        if hasattr(self.dataset, 'set_epoch'):
+            self.dataset.set_epoch(epoch)
+
+
 class BufferShuffledIterableDataset(IterableDataset):
     def __init__(
         self,
@@ -93,7 +199,7 @@ class BufferShuffledIterableDataset(IterableDataset):
     def tokenize(self, data, batch_size: int = 64):
         texts, states = [], []
         for sample in data:
-            texts.append(sample['text'])
+            texts.append(_extract_text(sample))
             states.append(self.data.state_dict())
             if len(texts) == batch_size:
                 for s, tokenized in zip(states, self.tokenizer(texts, return_attention_mask=False)['input_ids']):
@@ -185,12 +291,7 @@ class OnlineTokenizedIterableDataset(IterableDataset):
     def tokenize(self, data, buffer_size: int = 64):
         buffer, states = [], []
         for sample in data:
-            if sample.get('text', None) is not None:
-                buffer.append(sample['text'])
-            elif sample.get('content', None) is not None:
-                buffer.append(sample['content'])
-            else:
-                raise ValueError(f"No 'text' or 'content' field found in sample:\n{sample}")
+            buffer.append(_extract_text(sample))
             states.append(self.data.state_dict())
             if len(buffer) == buffer_size:
                 for s, tokenized in zip(states, self.tokenizer(buffer, return_attention_mask=False)['input_ids']):
@@ -553,9 +654,11 @@ def build_dataset(
     dp_degree: Optional[int] = None,
     num_workers: int = 32,
     seed: Optional[int] = None,
+    trust_remote_code: bool = False,
 ) -> IterableDataset:
     color = utils.Color
     min_num_shards = dp_degree * num_workers if dp_degree else None
+    dataset_num_rows = None
     if len(dataset.split(',')) == 1:
         dataset = load_dataset(
             path=dataset,
@@ -563,11 +666,16 @@ def build_dataset(
             split=dataset_split,
             data_dir=data_dir,
             data_files=data_files,
-            trust_remote_code=True,
+            trust_remote_code=trust_remote_code,
             streaming=streaming,
             num_proc=num_workers if not streaming else None,
         )
         logger.info(f"Shuffling the dataset with seed {seed}")
+        if not streaming and hasattr(dataset, "__len__"):
+            try:
+                dataset_num_rows = len(dataset)
+            except Exception:
+                dataset_num_rows = None
         if not streaming:
             # the states of map-style dataset is recoverable after shuffling
             if seed is not None:
@@ -590,7 +698,7 @@ def build_dataset(
                     split=dataset_split,
                     data_dir=data_dir,
                     data_files=data_files,
-                    trust_remote_code=True,
+                    trust_remote_code=trust_remote_code,
                     streaming=False,
                     num_proc=num_workers,
                 )
@@ -600,6 +708,9 @@ def build_dataset(
             else:
                 if seed is not None:
                     dataset = shuffle(dataset, seed=seed)
+        dataset = _ensure_text_column(dataset, streaming=streaming, num_workers=num_workers)
+        if dataset_num_rows is not None and isinstance(dataset, IterableDataset):
+            setattr(dataset, "_flame_num_rows", dataset_num_rows)
     else:
         datasets = dataset.split(",")
         if dataset_name is not None:
@@ -652,7 +763,7 @@ def build_dataset(
                 split=dataset_splits[i],
                 data_dir=data_dirs[i],
                 data_files=data_files[i],
-                trust_remote_code=True,
+                trust_remote_code=trust_remote_code,
                 streaming=streaming,
                 num_proc=(
                     num_workers
@@ -692,7 +803,7 @@ def build_dataset(
                         split=dataset_splits[i],
                         data_dir=data_dirs[i],
                         data_files=data_files[i],
-                        trust_remote_code=True,
+                        trust_remote_code=trust_remote_code,
                         streaming=False,
                         num_proc=num_workers,
                     )
@@ -704,14 +815,7 @@ def build_dataset(
                     if seed is not None:
                         subset = shuffle(subset, seed=seed, buffer_size=max(128, 1024 // len(datasets)))
 
-            if "text" in subset.column_names:
-                subset = subset.select_columns("text")
-            elif "content" in subset.column_names:
-                subset = subset.select_columns("content")
-            else:
-                raise ValueError(
-                    f"Subset {datasets[i]} has no 'text' or 'content' column"
-                )
+            subset = _ensure_text_column(subset, streaming=streaming, num_workers=num_workers)
             subsets.append(subset)
 
         logger.info(
@@ -740,10 +844,16 @@ def build_dataloader(
     pin_memory: bool = False,
     persistent_workers: bool = False,
     snapshot_every_n_steps: Optional[int] = 1,
+    sample_level: bool = False,
 ):
-    dataset = OnlineTokenizedIterableDataset(
-        dataset=dataset, tokenizer=tokenizer, seq_len=seq_len, rank=rank, world_size=world_size
-    )
+    if sample_level:
+        dataset = SampleLevelIterableDataset(
+            dataset=dataset, tokenizer=tokenizer, seq_len=seq_len, rank=rank, world_size=world_size
+        )
+    else:
+        dataset = OnlineTokenizedIterableDataset(
+            dataset=dataset, tokenizer=tokenizer, seq_len=seq_len, rank=rank, world_size=world_size
+        )
     return ParallelAwareDataLoader(
         rank=rank,
         dataset=dataset,

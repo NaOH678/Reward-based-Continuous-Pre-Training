@@ -5,10 +5,14 @@
 # LICENSE file in the root directory of this source tree.
 
 import json
+import math
 import os
 import time
 from datetime import timedelta
 
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+from datasets import IterableDataset
 import fla  # noqa
 import torch
 from fla.modules.fused_linear_cross_entropy import FusedLinearCrossEntropyLoss
@@ -36,6 +40,40 @@ from flame.data import build_dataloader, build_dataset
 from flame.models.parallelize_fla import parallelize_fla
 from flame.models.pipeline_fla import pipeline_fla
 from flame.tools.utils import get_nparams_and_flops
+
+
+def _peek_raw_sample(dataset):
+    """Return a single raw sample without assuming map or iterable semantics."""
+    if isinstance(dataset, IterableDataset):
+        iterator = dataset.take(1) if hasattr(dataset, "take") else iter(dataset)
+        try:
+            return next(iter(iterator))
+        except StopIteration:
+            return None
+    try:
+        return dataset[0]
+    except Exception:
+        return None
+
+
+def _log_sample_preview(dataset, tokenizer, color, max_chars: int = 400, max_tokens: int = 64):
+    sample = _peek_raw_sample(dataset)
+    if not sample:
+        logger.warning("Could not preview a training sample (dataset may be empty or non-iterable).")
+        return
+
+    text = sample.get("text") or sample.get("content") or ""
+    text_truncated = text if len(text) <= max_chars else f"{text[:max_chars]}…"
+    logger.info(f"{color.cyan}Sample text preview (truncated to {max_chars} chars):{color.reset}\n{text_truncated}")
+
+    if tokenizer and text:
+        try:
+            token_ids = tokenizer.encode(text, add_special_tokens=False)[:max_tokens]
+            decoded = tokenizer.decode(token_ids, skip_special_tokens=True)
+            logger.info(f"{color.cyan}First {len(token_ids)} token ids:{color.reset} {token_ids}")
+            logger.info(f"{color.cyan}Decoded preview:{color.reset}\n{decoded}")
+        except Exception as exc:
+            logger.warning(f"Failed to tokenize preview sample: {exc}")
 
 
 def build_tokenizer(job_config: JobConfig) -> AutoTokenizer:
@@ -152,6 +190,11 @@ def main(job_config: JobConfig):
         if job_config.training.dataset_name is not None
         else ""
     )
+    global_batch_size = (
+        job_config.training.batch_size
+        * dp_degree
+        * job_config.training.gradient_accumulation_steps
+    )
     dataset = build_dataset(
         dataset=job_config.training.dataset,
         dataset_name=job_config.training.dataset_name,
@@ -163,7 +206,25 @@ def main(job_config: JobConfig):
         dp_degree=dp_degree,
         num_workers=job_config.training.num_workers,
         seed=job_config.training.seed,
+        trust_remote_code=job_config.training.trust_remote_code,
     )
+    dataset_size = getattr(dataset, "_flame_num_rows", None)
+    if job_config.training.epochs is not None:
+        if dataset_size is None:
+            raise ValueError(
+                "training.epochs is set but dataset size is unknown (streaming or interleaved dataset). "
+                "Disable streaming and use a single map-style dataset to enable epoch-based scheduling."
+            )
+        computed_steps = math.ceil(
+            dataset_size * job_config.training.epochs / global_batch_size
+        )
+        logger.info(
+            f"Overriding training.steps to {computed_steps} based on epochs={job_config.training.epochs}, "
+            f"dataset_size={dataset_size}, global_batch_size={global_batch_size}"
+        )
+        job_config.training.steps = computed_steps
+    if dp_rank == 0:
+        _log_sample_preview(dataset, tokenizer, color)
 
     logger.info("Building dataloader...")
     dataloader = build_dataloader(
@@ -179,6 +240,7 @@ def main(job_config: JobConfig):
         pin_memory=job_config.training.pin_memory,
         persistent_workers=job_config.training.persistent_workers,
         snapshot_every_n_steps=job_config.checkpoint.interval,
+        sample_level=job_config.training.sample_level,
     )
 
     logger.info(f"Loading model config from {job_config.model.config}")
@@ -359,11 +421,6 @@ def main(job_config: JobConfig):
     # variables used to keep info for metrics logging
     device_memory_monitor.reset_peak_stats()
 
-    global_batch_size = (
-        job_config.training.batch_size
-        * dp_degree
-        * job_config.training.gradient_accumulation_steps
-    )
     num_tokens_per_step = global_batch_size * job_config.training.seq_len
     # train loop
     logger.info(f"{color.red}***** Running training *****{color.reset}")
@@ -381,6 +438,16 @@ def main(job_config: JobConfig):
         f"{color.green}  Global batch size (w. parallel, distributed & accumulation) = {global_batch_size:,}"
         f" ({num_tokens_per_step:,} tokens)"
     )
+    steps_per_epoch = None
+    tokens_per_epoch = None
+    if job_config.training.epochs is not None and dataset_size is not None:
+        steps_per_epoch = math.ceil(dataset_size / global_batch_size)
+        tokens_per_epoch = steps_per_epoch * num_tokens_per_step
+        logger.info(
+            f"{color.green}  Epoch mode: epochs = {job_config.training.epochs:,}, "
+            f"steps/epoch ≈ {steps_per_epoch:,} ({tokens_per_epoch:,} tokens), "
+            f"dataset_size = {dataset_size:,}{color.reset}"
+        )
     logger.info(
         f"{color.green}  Total optimization steps = {job_config.training.steps:,} "
         f"({job_config.training.steps * num_tokens_per_step:,} tokens)"

@@ -281,6 +281,11 @@ class JobConfig:
             help="Whether to take sequences of variable length as input",
         )
         self.parser.add_argument(
+            "--training.sample_level",
+            action="store_true",
+            help="Process data per-sample (no cross-sample concatenation) in the dataloader.",
+        )
+        self.parser.add_argument(
             "--training.gradient_accumulation_steps",
             type=int,
             default=1,
@@ -291,6 +296,12 @@ class JobConfig:
             type=int,
             default=10000,
             help="How many train steps to run",
+        )
+        self.parser.add_argument(
+            "--training.epochs",
+            type=int,
+            default=None,
+            help="Number of epochs to run; overrides steps if set and dataset size is known.",
         )
         self.parser.add_argument(
             "--training.max_norm",
@@ -337,6 +348,11 @@ class JobConfig:
             "--training.streaming",
             action="store_true",
             help="Whether to load dataset in streaming mode, used for huge dataset",
+        )
+        self.parser.add_argument(
+            "--training.trust_remote_code",
+            action="store_true",
+            help="Allow datasets.load_dataset to execute remote code. Default off for safety.",
         )
         self.parser.add_argument(
             "--training.num_workers",
