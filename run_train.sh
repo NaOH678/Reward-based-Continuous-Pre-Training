@@ -11,20 +11,25 @@ LOG_RANK=0 bash train.sh \
     --optimizer.lr 5e-4 \
     --lr_scheduler.warmup_steps 2048 \
     --lr_scheduler.decay_type cosine \
-    --training.batch_size 8 \
-    --training.seq_len 4096 \
+    --training.batch_size 1 \
+    --training.seq_len 15700 \
     --training.context_len 4096 \
     --training.gradient_accumulation_steps 16 \
-    --training.steps 47683 \
+    --training.epochs 3 \
     --training.max_norm 1.0 \
     --training.skip_nan_inf \
-    --training.dataset ../../formalverification-shared/shichaojian/OpenThoughts \
+    --training.dataset parquet \
+    --training.dataset ../../formalverification-shared/shichaojian/OpenThoughts/data \
+    --training.trust_remote_code \
     --training.dataset_split train \
     --training.num_workers 15 \
     --training.prefetch_factor 2 \
     --training.seed 42 \
-    --checkpoint.interval 2048 \
+    --training.sample_level \
+    --future_encoder.enable \
+    --future_encoder.future_k '-1' \
+    --future_encoder.summary_method attention \
+    --checkpoint.interval 1000 \
     --checkpoint.load_step 0 \
     --checkpoint.keep_latest_k 2 \
     --metrics.log_freq 1 \
-    --training.streaming \
