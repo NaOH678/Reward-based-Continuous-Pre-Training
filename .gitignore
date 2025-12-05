@@ -5,7 +5,7 @@ test.py
 data
 
 # bash scripts
-*.sh
+
 
 # docs
 docs/_build
