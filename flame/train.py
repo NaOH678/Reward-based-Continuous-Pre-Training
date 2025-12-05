@@ -362,7 +362,7 @@ def main(job_config: JobConfig):
         model_parts.append(future_encoder)
         
         mi_estimator = build_mi_estimator(
-            estimator_type=job_config.mi_estimator,
+            estimator_type=job_config.future_encoder.estimator_type,
             hidden_size=model_config.hidden_size,
             temperature=job_config.future_encoder.temperature,
         )
