@@ -602,11 +602,14 @@ def main(job_config: JobConfig):
                             # We want the last layer
                             hidden_states = output.hidden_states[-1]
                             future_summaries = future_encoder(hidden_states)
-                            aux_loss = mi_estimator(hidden_states, future_summaries)
+                            aux_loss, log_N = mi_estimator(hidden_states, future_summaries)
                             loss += aux_loss * job_config.future_encoder.loss_weight
                             
-                            # Log aux loss (optional, or add to metrics)
-                            # For now, we just add it to the total loss.
+                            # Calculate MI lower bound: I >= log(N) - Loss
+                            mi_lower_bound = log_N - aux_loss.detach()
+                        else:
+                            aux_loss = torch.tensor(0.0, device=device)
+                            mi_lower_bound = torch.tensor(0.0, device=device)
                             
                         loss.backward()
 
@@ -654,9 +657,23 @@ def main(job_config: JobConfig):
                             world_mesh["dp_cp"],
                         ),
                     )
+                    
+                    if job_config.future_encoder.enable:
+                        global_avg_aux_loss = dist_utils.dist_mean(aux_loss.detach(), world_mesh["dp_cp"])
+                        global_avg_mi_lb = dist_utils.dist_mean(mi_lower_bound, world_mesh["dp_cp"])
+                    else:
+                        global_avg_aux_loss = 0.0
+                        global_avg_mi_lb = 0.0
+                        
                 else:
                     # Scale back the loss before logging
                     global_avg_loss = global_max_loss = loss.item()
+                    if job_config.future_encoder.enable:
+                        global_avg_aux_loss = aux_loss.item()
+                        global_avg_mi_lb = mi_lower_bound.item()
+                    else:
+                        global_avg_aux_loss = 0.0
+                        global_avg_mi_lb = 0.0
 
                 # Update train state tokens and elapsed time
                 time_now = time.perf_counter()
@@ -680,15 +697,21 @@ def main(job_config: JobConfig):
                     * (job_config.training.steps - train_state.step)
                     / train_state.step
                 )
+                metrics = {
+                    "loss": global_avg_loss,
+                    "loss_max": global_max_loss,
+                    "optimizer/lr": last_lr,
+                    "optimizer/grad_norm": grad_norm.item(),
+                    "optimizer/skipped_step": train_state.skipped_step,
+                }
+                
+                if job_config.future_encoder.enable:
+                    metrics["aux_loss"] = global_avg_aux_loss
+                    metrics["mi_lower_bound"] = global_avg_mi_lb
+                
                 metric_logger.log(
-                    train_state.step,
-                    global_avg_loss,
-                    global_max_loss,
-                    extra_metrics={
-                        "optimizer/lr": last_lr,
-                        "optimizer/grad_norm": grad_norm.item(),
-                        "optimizer/skipped_step": train_state.skipped_step,
-                    },
+                    metrics,
+                    step=train_state.step,
                 )
 
                 logger.info(
