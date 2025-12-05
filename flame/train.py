@@ -697,21 +697,21 @@ def main(job_config: JobConfig):
                     * (job_config.training.steps - train_state.step)
                     / train_state.step
                 )
-                metrics = {
-                    "loss": global_avg_loss,
-                    "loss_max": global_max_loss,
+                extra_metrics = {
                     "optimizer/lr": last_lr,
                     "optimizer/grad_norm": grad_norm.item(),
                     "optimizer/skipped_step": train_state.skipped_step,
                 }
-                
+
                 if job_config.future_encoder.enable:
-                    metrics["aux_loss"] = global_avg_aux_loss
-                    metrics["mi_lower_bound"] = global_avg_mi_lb
-                
+                    extra_metrics["aux_loss"] = global_avg_aux_loss
+                    extra_metrics["mi_lower_bound"] = global_avg_mi_lb
+
                 metric_logger.log(
-                    metrics,
-                    step=train_state.step,
+                    train_state.step,
+                    global_avg_loss=global_avg_loss,
+                    global_max_loss=global_max_loss,
+                    extra_metrics=extra_metrics,
                 )
 
                 logger.info(
