@@ -359,7 +359,8 @@ def main(job_config: JobConfig):
         )
         future_encoder.to(init_device)
         future_encoder.train()
-        model_parts.append(future_encoder)
+        if len(list(future_encoder.parameters())) > 0:
+            model_parts.append(future_encoder)
         
         mi_estimator = build_mi_estimator(
             estimator_type=job_config.future_encoder.estimator_type,
@@ -368,7 +369,8 @@ def main(job_config: JobConfig):
         )
         mi_estimator.to(init_device)
         mi_estimator.train()
-        model_parts.append(mi_estimator)
+        if len(list(mi_estimator.parameters())) > 0:
+            model_parts.append(mi_estimator)
 
     device_mem_stats = device_memory_monitor.get_peak_stats()
     logger.info(
