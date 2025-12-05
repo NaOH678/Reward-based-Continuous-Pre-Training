@@ -782,6 +782,45 @@ class JobConfig:
             """,
         )
 
+        # future encoder configs
+        self.parser.add_argument(
+            "--future_encoder.enable",
+            action="store_true",
+            help="Whether to enable Future Encoder for CPT",
+        )
+        self.parser.add_argument(
+            "--future_encoder.future_k",
+            type=int,
+            default=4,
+            help="Horizon for future summary. If -1, use all remaining tokens.",
+        )
+        self.parser.add_argument(
+            "--future_encoder.summary_method",
+            type=str,
+            default="mean",
+            choices=["mean", "max", "attention"],
+            help="Method to summarize future tokens.",
+        )
+        self.parser.add_argument(
+            "--mi_estimator",
+            type=str,
+            default="infonce",
+            choices=["infonce"],
+            help="Type of Mutual Information estimator.",
+        )
+        self.parser.add_argument(
+            "--future_encoder.temperature",
+            type=float,
+            default=0.1,
+            help="Temperature for InfoNCE loss.",
+        )
+        self.parser.add_argument(
+            "--future_encoder.loss_weight",
+            type=float,
+            default=0.1,
+            help="Weight of the auxiliary Future Encoder loss.",
+        )
+
         # float8 configs
         self.parser.add_argument(
             "--float8.enable_fsdp_float8_all_gather",

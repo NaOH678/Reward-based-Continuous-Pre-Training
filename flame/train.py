@@ -39,6 +39,8 @@ from flame.config_manager import JobConfig
 from flame.data import build_dataloader, build_dataset
 from flame.models.parallelize_fla import parallelize_fla
 from flame.models.pipeline_fla import pipeline_fla
+from flame.models.future_encoder import FutureEncoder
+from flame.models.mi_estimator import build_mi_estimator
 from flame.tools.utils import get_nparams_and_flops
 
 
@@ -345,6 +347,29 @@ def main(job_config: JobConfig):
 
         model_parts = [model]
 
+    # Initialize Future Encoder and MI Estimator if enabled
+    future_encoder = None
+    mi_estimator = None
+    if job_config.future_encoder.enable:
+        logger.info("Initializing Future Encoder and MI Estimator...")
+        future_encoder = FutureEncoder(
+            hidden_size=model_config.hidden_size,
+            future_k=job_config.future_encoder.future_k,
+            summary_method=job_config.future_encoder.summary_method,
+        )
+        future_encoder.to(init_device)
+        future_encoder.train()
+        model_parts.append(future_encoder)
+        
+        mi_estimator = build_mi_estimator(
+            estimator_type=job_config.mi_estimator,
+            hidden_size=model_config.hidden_size,
+            temperature=job_config.future_encoder.temperature,
+        )
+        mi_estimator.to(init_device)
+        mi_estimator.train()
+        model_parts.append(mi_estimator)
+
     device_mem_stats = device_memory_monitor.get_peak_stats()
     logger.info(
         f"{device_type.upper()} memory usage for model: "
@@ -562,11 +587,25 @@ def main(job_config: JobConfig):
                                 labels=labels,
                                 position_ids=position_ids,
                                 cu_seqlens=cu_seqlens,
+                                output_hidden_states=job_config.future_encoder.enable,
                         )
                         loss = (
                             output.loss
                             / job_config.training.gradient_accumulation_steps
                         )
+                        
+                        if future_encoder is not None and mi_estimator is not None:
+                            # Extract last hidden state
+                            # output.hidden_states is a tuple of (batch, seq, hidden) for each layer
+                            # We want the last layer
+                            hidden_states = output.hidden_states[-1]
+                            future_summaries = future_encoder(hidden_states)
+                            aux_loss = mi_estimator(hidden_states, future_summaries)
+                            loss += aux_loss * job_config.future_encoder.loss_weight
+                            
+                            # Log aux loss (optional, or add to metrics)
+                            # For now, we just add it to the total loss.
+                            
                         loss.backward()
 
                 losses.append(loss)
