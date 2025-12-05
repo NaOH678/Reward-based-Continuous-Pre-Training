@@ -802,7 +802,7 @@ class JobConfig:
             help="Method to summarize future tokens.",
         )
         self.parser.add_argument(
-            "--mi_estimator",
+            "--future_encoder.estimator_type",
             type=str,
             default="infonce",
             choices=["infonce"],
