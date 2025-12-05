@@ -502,6 +502,9 @@ def main(job_config: JobConfig):
             optimizers.zero_grad()
 
             losses = []
+            ce_losses = []
+            aux_losses = []
+            mi_lower_bounds = []
             # do gradient accumulation if enabled
             for _ in range(job_config.training.gradient_accumulation_steps):
                 # get batch
@@ -591,10 +594,11 @@ def main(job_config: JobConfig):
                                 cu_seqlens=cu_seqlens,
                                 output_hidden_states=job_config.future_encoder.enable,
                         )
-                        loss = (
+                        ce_loss = (
                             output.loss
                             / job_config.training.gradient_accumulation_steps
                         )
+                        loss = ce_loss
                         
                         if future_encoder is not None and mi_estimator is not None:
                             # Extract last hidden state
@@ -614,7 +618,13 @@ def main(job_config: JobConfig):
                         loss.backward()
 
                 losses.append(loss)
+                ce_losses.append(ce_loss.detach())
+                aux_losses.append(aux_loss.detach())
+                mi_lower_bounds.append(mi_lower_bound.detach())
             loss = sum(losses)
+            ce_loss_total = sum(ce_losses)
+            aux_loss_total = sum(aux_losses)
+            mi_lower_bound_total = sum(mi_lower_bounds)
 
             # clip gradients
             grad_norm = dist_utils.clip_grad_norm_(
@@ -646,6 +656,9 @@ def main(job_config: JobConfig):
                     or parallel_dims.cp_enabled
                 ):
                     loss = loss.detach()
+                    ce_loss_total = ce_loss_total.detach()
+                    aux_loss_total = aux_loss_total.detach()
+                    mi_lower_bound_total = mi_lower_bound_total.detach()
                     # Use dist_mean/max on the accumulated loss for the step
                     global_avg_loss, global_max_loss = (
                         dist_utils.dist_mean(
@@ -657,10 +670,13 @@ def main(job_config: JobConfig):
                             world_mesh["dp_cp"],
                         ),
                     )
+                    global_avg_ce_loss = dist_utils.dist_mean(
+                        ce_loss_total, world_mesh["dp_cp"]
+                    )
                     
                     if job_config.future_encoder.enable:
-                        global_avg_aux_loss = dist_utils.dist_mean(aux_loss.detach(), world_mesh["dp_cp"])
-                        global_avg_mi_lb = dist_utils.dist_mean(mi_lower_bound, world_mesh["dp_cp"])
+                        global_avg_aux_loss = dist_utils.dist_mean(aux_loss_total, world_mesh["dp_cp"])
+                        global_avg_mi_lb = dist_utils.dist_mean(mi_lower_bound_total, world_mesh["dp_cp"])
                     else:
                         global_avg_aux_loss = 0.0
                         global_avg_mi_lb = 0.0
@@ -668,9 +684,10 @@ def main(job_config: JobConfig):
                 else:
                     # Scale back the loss before logging
                     global_avg_loss = global_max_loss = loss.item()
+                    global_avg_ce_loss = ce_loss_total.item()
                     if job_config.future_encoder.enable:
-                        global_avg_aux_loss = aux_loss.item()
-                        global_avg_mi_lb = mi_lower_bound.item()
+                        global_avg_aux_loss = aux_loss_total.item()
+                        global_avg_mi_lb = mi_lower_bound_total.item()
                     else:
                         global_avg_aux_loss = 0.0
                         global_avg_mi_lb = 0.0
@@ -698,6 +715,7 @@ def main(job_config: JobConfig):
                     / train_state.step
                 )
                 extra_metrics = {
+                    "loss_ce": global_avg_ce_loss,
                     "optimizer/lr": last_lr,
                     "optimizer/grad_norm": grad_norm.item(),
                     "optimizer/skipped_step": train_state.skipped_step,
