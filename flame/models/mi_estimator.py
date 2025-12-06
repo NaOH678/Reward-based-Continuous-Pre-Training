@@ -61,10 +61,9 @@ class InfoNCEEstimator(MIEstimator):
 
         loss = F.cross_entropy(logits, labels)
 
-        count = torch.tensor(float(x_valid.shape[0]), device=x.device, dtype=torch.float)
-        log_N = torch.log(torch.clamp(count, min=1.0))
+        
 
-        return loss, log_N
+        return loss
 
 def build_mi_estimator(estimator_type: str, hidden_size: int, **kwargs):
     if estimator_type == "infonce":
