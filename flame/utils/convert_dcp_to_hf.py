@@ -47,8 +47,15 @@ def save_pretrained(
 
         # Add datetime.timedelta and io.BytesIO to safe globals
         torch.serialization.add_safe_globals([timedelta, io.BytesIO])
+        loaded = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+        model_state = loaded["model"] if "model" in loaded else loaded
+
         # torch.load now with default weights_only=True will work
-        model.load_state_dict(torch.load(checkpoint_path, map_location='cpu')['model'])
+        missing, unexpected = model.load_state_dict(model_state, strict=False)
+        if missing:
+            logger.warning(f"Missing keys while loading model: {missing}")
+        if unexpected:
+            logger.warning(f"Unexpected keys ignored while loading model: {unexpected}")
 
         logger.info(f"Saving the model to {path}")
         model.save_pretrained(path)
