@@ -15,6 +15,8 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 from datasets import IterableDataset
 import fla  # noqa
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from fla.modules.fused_linear_cross_entropy import FusedLinearCrossEntropyLoss
 from fla.ops.utils import prepare_position_ids
 from torch.distributed.elastic.multiprocessing.errors import record
@@ -360,6 +362,15 @@ def main(job_config: JobConfig):
         future_encoder.to(init_device)
         future_encoder.train()
         if len(list(future_encoder.parameters())) > 0:
+            if parallel_dims.dp_replicate_enabled:
+                ddp_kwargs = (
+                    {"device_ids": [device.index], "output_device": device.index}
+                    if device.type == "cuda"
+                    else {}
+                )
+                future_encoder = DDP(
+                    future_encoder, broadcast_buffers=False, **ddp_kwargs
+                )
             model_parts.append(future_encoder)
         
         mi_estimator = build_mi_estimator(
@@ -370,6 +381,13 @@ def main(job_config: JobConfig):
         mi_estimator.to(init_device)
         mi_estimator.train()
         if len(list(mi_estimator.parameters())) > 0:
+            if parallel_dims.dp_replicate_enabled:
+                ddp_kwargs = (
+                    {"device_ids": [device.index], "output_device": device.index}
+                    if device.type == "cuda"
+                    else {}
+                )
+                mi_estimator = DDP(mi_estimator, broadcast_buffers=False, **ddp_kwargs)
             model_parts.append(mi_estimator)
 
     device_mem_stats = device_memory_monitor.get_peak_stats()
@@ -501,10 +519,12 @@ def main(job_config: JobConfig):
 
             optimizers.zero_grad()
 
+            inv_grad_acc_steps = 1.0 / job_config.training.gradient_accumulation_steps
             losses = []
             ce_losses = []
             aux_losses = []
-            mi_lower_bounds = []
+            # mi_lower_bounds = []
+            counts = []
             # do gradient accumulation if enabled
             for _ in range(job_config.training.gradient_accumulation_steps):
                 # get batch
@@ -533,6 +553,11 @@ def main(job_config: JobConfig):
 
                 """
                 labels = labels.to(device_type)
+                attention_mask = (
+                    batch["attention_mask"].to(device_type)
+                    if "attention_mask" in batch
+                    else None
+                )
                 cu_seqlens = (
                     batch["cu_seqlens"].to(device_type)
                     if "cu_seqlens" in batch
@@ -591,41 +616,51 @@ def main(job_config: JobConfig):
                                 input_ids=input_ids,
                                 labels=labels,
                                 position_ids=position_ids,
+                                attention_mask=attention_mask,
                                 cu_seqlens=cu_seqlens,
                                 output_hidden_states=job_config.future_encoder.enable,
                         )
-                        ce_loss = (
-                            output.loss
-                            / job_config.training.gradient_accumulation_steps
-                        )
+                        ce_loss_raw = output.loss
+                        ce_loss = ce_loss_raw * inv_grad_acc_steps
                         total_loss = ce_loss
                         
                         if future_encoder is not None and mi_estimator is not None:
-                            # Extract last hidden state
-                            # output.hidden_states is a tuple of (batch, seq, hidden) for each layer
-                            # We want the last layer
                             hidden_states = output.hidden_states[-1]
-                            future_summaries = future_encoder(hidden_states)
-                            aux_loss, log_N = mi_estimator(hidden_states, future_summaries)
-                            total_loss = ce_loss + aux_loss * job_config.future_encoder.loss_weight
+                            future_summaries, future_valid = future_encoder(
+                                hidden_states, attention_mask=attention_mask
+                            )
+                            aux_loss, count = mi_estimator(
+                                hidden_states, future_summaries, valid_mask=future_valid
+                            )
+                            aux_loss_scaled = (
+                                aux_loss
+                                * inv_grad_acc_steps
+                                * job_config.future_encoder.loss_weight
+                            )
+                            total_loss = ce_loss + aux_loss_scaled
                             
-                            # Calculate MI lower bound: I >= log(N) - Loss
-                            mi_lower_bound = log_N - aux_loss.detach()
+                            # mi_lower_bound = (
+                            #     torch.log(torch.clamp(count, min=1.0))
+                            #     - aux_loss.detach()
+                            # )
                         else:
                             aux_loss = torch.tensor(0.0, device=device)
-                            mi_lower_bound = torch.tensor(0.0, device=device)
+                            # mi_lower_bound = torch.tensor(0.0, device=device)
+                            count = torch.tensor(0.0, device=device)
                             
                         total_loss.backward()
 
                 losses.append(total_loss)
-                ce_losses.append(ce_loss.detach())
+                ce_losses.append(ce_loss_raw.detach())
                 aux_losses.append(aux_loss.detach())
-                mi_lower_bounds.append(mi_lower_bound.detach())
+                # mi_lower_bounds.append(mi_lower_bound.detach())
+                counts.append(count.detach())
 
             loss = sum(losses)
             ce_loss_total = sum(ce_losses)
             aux_loss_total = sum(aux_losses)
-            mi_lower_bound_total = sum(mi_lower_bounds)
+            # mi_lower_bound_total = sum(mi_lower_bounds)
+            count_total = sum(counts)
 
             # clip gradients
             grad_norm = dist_utils.clip_grad_norm_(
@@ -677,7 +712,13 @@ def main(job_config: JobConfig):
                     
                     if job_config.future_encoder.enable:
                         global_avg_aux_loss = dist_utils.dist_mean(aux_loss_total, world_mesh["dp_cp"])
-                        global_avg_mi_lb = dist_utils.dist_mean(mi_lower_bound_total, world_mesh["dp_cp"])
+                        global_count = count_total.detach()
+                        if dist.is_available() and dist.is_initialized():
+                            dist.all_reduce(global_count, op=dist.ReduceOp.SUM)
+                        global_avg_mi_lb = (
+                            torch.log(torch.clamp(global_count, min=1.0))
+                            - global_avg_aux_loss
+                        )
                     else:
                         global_avg_aux_loss = 0.0
                         global_avg_mi_lb = 0.0
@@ -688,7 +729,8 @@ def main(job_config: JobConfig):
                     global_avg_ce_loss = ce_loss_total.item()
                     if job_config.future_encoder.enable:
                         global_avg_aux_loss = aux_loss_total.item()
-                        global_avg_mi_lb = mi_lower_bound_total.item()
+                        global_count = count_total.item()
+                        global_avg_mi_lb = math.log(max(global_count, 1.0)) - global_avg_aux_loss
                     else:
                         global_avg_aux_loss = 0.0
                         global_avg_mi_lb = 0.0
