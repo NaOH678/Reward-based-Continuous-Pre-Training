@@ -20,10 +20,12 @@ class TestFutureEncoderAndMIEstimator(unittest.TestCase):
         estimator = build_mi_estimator("infonce", self.hidden_size)
         
         summaries = encoder(self.hidden_states)
-        loss = estimator(self.hidden_states, summaries)
+        loss, log_N = estimator(self.hidden_states, summaries)
         
         self.assertIsInstance(loss, torch.Tensor)
+        self.assertIsInstance(log_N, torch.Tensor)
         self.assertTrue(loss.item() >= 0)
+        self.assertTrue(log_N.item() > 0)
 
     def test_mi_estimator_backward(self):
         encoder = FutureEncoder(self.hidden_size, future_k=2)
@@ -31,7 +33,7 @@ class TestFutureEncoderAndMIEstimator(unittest.TestCase):
         
         self.hidden_states.requires_grad = True
         summaries = encoder(self.hidden_states)
-        loss = estimator(self.hidden_states, summaries)
+        loss, log_N = estimator(self.hidden_states, summaries)
         loss.backward()
         
         self.assertIsNotNone(self.hidden_states.grad)

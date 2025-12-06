@@ -15,7 +15,7 @@ LOG_RANK=0 bash train.sh \
     --training.seq_len 15700 \
     --training.context_len 4096 \
     --training.gradient_accumulation_steps 16 \
-    --training.epochs 3 \
+    --training.epochs 1 \
     --training.max_norm 1.0 \
     --training.skip_nan_inf \
     --training.dataset parquet \
@@ -26,10 +26,6 @@ LOG_RANK=0 bash train.sh \
     --training.prefetch_factor 2 \
     --training.seed 42 \
     --training.sample_level \
-    --future_encoder.enable \
-    --future_encoder.future_k '-1' \
-    --future_encoder.summary_method attention \
-    --future_encoder.loss_weight 0.1 \
     --checkpoint.interval 1000 \
     --checkpoint.load_step 0 \
     --checkpoint.keep_latest_k 2 \

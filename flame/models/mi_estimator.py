@@ -34,6 +34,7 @@ class InfoNCEEstimator(MIEstimator):
             y: (Batch, SeqLen, HiddenDim) - Future summaries
         Returns:
             loss: scalar tensor
+            log_N: scalar tensor (log of batch size for contrastive learning)
         """
         # We only compute loss for steps where y is valid (non-zero).
         # Assuming y is zero where there is no future (e.g. last step).
@@ -55,7 +56,7 @@ class InfoNCEEstimator(MIEstimator):
         y_valid = y[mask] # (N, Hidden)
         
         if x_valid.shape[0] == 0:
-            return torch.tensor(0.0, device=x.device, requires_grad=True)
+            return torch.tensor(0.0, device=x.device, requires_grad=True), torch.tensor(0.0, device=x.device)
             
         # Normalize
         x_norm = F.normalize(x_valid, p=2, dim=-1)
@@ -69,7 +70,7 @@ class InfoNCEEstimator(MIEstimator):
         
         loss = F.cross_entropy(logits, labels)
         
-        return loss
+        return loss, torch.log(torch.tensor(x_valid.shape[0], dtype=torch.float, device=x.device))
 
 def build_mi_estimator(estimator_type: str, hidden_size: int, **kwargs):
     if estimator_type == "infonce":

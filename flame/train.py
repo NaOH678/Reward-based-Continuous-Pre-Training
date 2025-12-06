@@ -502,6 +502,9 @@ def main(job_config: JobConfig):
             optimizers.zero_grad()
 
             losses = []
+            ce_losses = []
+            aux_losses = []
+            mi_lower_bounds = []
             # do gradient accumulation if enabled
             for _ in range(job_config.training.gradient_accumulation_steps):
                 # get batch
@@ -591,10 +594,11 @@ def main(job_config: JobConfig):
                                 cu_seqlens=cu_seqlens,
                                 output_hidden_states=job_config.future_encoder.enable,
                         )
-                        loss = (
+                        ce_loss = (
                             output.loss
                             / job_config.training.gradient_accumulation_steps
                         )
+                        total_loss = ce_loss
                         
                         if future_encoder is not None and mi_estimator is not None:
                             # Extract last hidden state
@@ -602,16 +606,26 @@ def main(job_config: JobConfig):
                             # We want the last layer
                             hidden_states = output.hidden_states[-1]
                             future_summaries = future_encoder(hidden_states)
-                            aux_loss = mi_estimator(hidden_states, future_summaries)
-                            loss += aux_loss * job_config.future_encoder.loss_weight
+                            aux_loss, log_N = mi_estimator(hidden_states, future_summaries)
+                            total_loss = ce_loss + aux_loss * job_config.future_encoder.loss_weight
                             
-                            # Log aux loss (optional, or add to metrics)
-                            # For now, we just add it to the total loss.
+                            # Calculate MI lower bound: I >= log(N) - Loss
+                            mi_lower_bound = log_N - aux_loss.detach()
+                        else:
+                            aux_loss = torch.tensor(0.0, device=device)
+                            mi_lower_bound = torch.tensor(0.0, device=device)
                             
-                        loss.backward()
+                        total_loss.backward()
 
-                losses.append(loss)
+                losses.append(total_loss)
+                ce_losses.append(ce_loss.detach())
+                aux_losses.append(aux_loss.detach())
+                mi_lower_bounds.append(mi_lower_bound.detach())
+
             loss = sum(losses)
+            ce_loss_total = sum(ce_losses)
+            aux_loss_total = sum(aux_losses)
+            mi_lower_bound_total = sum(mi_lower_bounds)
 
             # clip gradients
             grad_norm = dist_utils.clip_grad_norm_(
@@ -643,6 +657,9 @@ def main(job_config: JobConfig):
                     or parallel_dims.cp_enabled
                 ):
                     loss = loss.detach()
+                    ce_loss_total = ce_loss_total.detach()
+                    aux_loss_total = aux_loss_total.detach()
+                    mi_lower_bound_total = mi_lower_bound_total.detach()
                     # Use dist_mean/max on the accumulated loss for the step
                     global_avg_loss, global_max_loss = (
                         dist_utils.dist_mean(
@@ -654,9 +671,27 @@ def main(job_config: JobConfig):
                             world_mesh["dp_cp"],
                         ),
                     )
+                    global_avg_ce_loss = dist_utils.dist_mean(
+                        ce_loss_total, world_mesh["dp_cp"]
+                    )
+                    
+                    if job_config.future_encoder.enable:
+                        global_avg_aux_loss = dist_utils.dist_mean(aux_loss_total, world_mesh["dp_cp"])
+                        global_avg_mi_lb = dist_utils.dist_mean(mi_lower_bound_total, world_mesh["dp_cp"])
+                    else:
+                        global_avg_aux_loss = 0.0
+                        global_avg_mi_lb = 0.0
+                    
                 else:
                     # Scale back the loss before logging
                     global_avg_loss = global_max_loss = loss.item()
+                    global_avg_ce_loss = ce_loss_total.item()
+                    if job_config.future_encoder.enable:
+                        global_avg_aux_loss = aux_loss_total.item()
+                        global_avg_mi_lb = mi_lower_bound_total.item()
+                    else:
+                        global_avg_aux_loss = 0.0
+                        global_avg_mi_lb = 0.0
 
                 # Update train state tokens and elapsed time
                 time_now = time.perf_counter()
@@ -680,15 +715,22 @@ def main(job_config: JobConfig):
                     * (job_config.training.steps - train_state.step)
                     / train_state.step
                 )
+                extra_metrics = {
+                    "loss_ce": global_avg_ce_loss,
+                    "optimizer/lr": last_lr,
+                    "optimizer/grad_norm": grad_norm.item(),
+                    "optimizer/skipped_step": train_state.skipped_step,
+                }
+
+                if job_config.future_encoder.enable:
+                    extra_metrics["aux_loss"] = global_avg_aux_loss
+                    extra_metrics["mi_lower_bound"] = global_avg_mi_lb
+
                 metric_logger.log(
                     train_state.step,
-                    global_avg_loss,
-                    global_max_loss,
-                    extra_metrics={
-                        "optimizer/lr": last_lr,
-                        "optimizer/grad_norm": grad_norm.item(),
-                        "optimizer/skipped_step": train_state.skipped_step,
-                    },
+                    global_avg_loss=global_avg_loss,
+                    global_max_loss=global_max_loss,
+                    extra_metrics=extra_metrics,
                 )
 
                 logger.info(
