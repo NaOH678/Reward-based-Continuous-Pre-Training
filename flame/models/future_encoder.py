@@ -45,6 +45,7 @@ class FutureEncoder(nn.Module):
             The summary at index t corresponds to the summary of the future of t.
             If no future exists (last steps), the summary might be zero or masked later.
         """
+        input_dtype = hidden_states.dtype
         batch_size, seq_len, hidden_dim = hidden_states.shape
 
         # Build mask tensor
@@ -88,10 +89,13 @@ class FutureEncoder(nn.Module):
             count_start = count_cumsum[:, start_indices]
             window_count = count_end - count_start
 
-            # Avoid division by zero
+            # Avoid division by zero; keep dtype aligned with hidden_states to prevent
+            # downstream mixed-precision matmul issues.
             window_count_clamped = torch.clamp(window_count, min=1.0)
 
-            future_summaries = window_sum / window_count_clamped.unsqueeze(-1)
+            future_summaries = (
+                window_sum / window_count_clamped.unsqueeze(-1)
+            ).to(input_dtype)
 
             # Mask out invalid steps (where no future exists)
             future_valid = valid_mask.unsqueeze(0) & (window_count > 0).unsqueeze(0)
@@ -154,7 +158,7 @@ class FutureEncoder(nn.Module):
 
                 attn_weights = F.softmax(attn_scores, dim=-1)
                 attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
-                summary = torch.bmm(attn_weights, v)
+                summary = torch.bmm(attn_weights, v).to(input_dtype)
 
                 # valid if there exists a future valid token
                 future_valid = combined_mask.any(dim=-1)
@@ -182,9 +186,9 @@ class FutureEncoder(nn.Module):
                 attn_weights = F.softmax(attn_scores, dim=-1)
                 attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
 
-                summary = torch.matmul(attn_weights, v).squeeze(2)
+                summary = torch.matmul(attn_weights, v).squeeze(2).to(input_dtype)
                 future_valid = future_mask.any(dim=-1)
 
                 return summary, future_valid
 
-        return hidden_states.new_zeros(hidden_states.shape), mask.new_zeros(mask.shape)
+        return hidden_states.new_zeros(hidden_states.shape).to(input_dtype), mask.new_zeros(mask.shape)

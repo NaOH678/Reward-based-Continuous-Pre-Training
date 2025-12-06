@@ -37,7 +37,6 @@ class InfoNCEEstimator(MIEstimator):
             valid_mask: (Batch, SeqLen) bool mask indicating positions with at least one future token.
         Returns:
             loss: scalar tensor
-            count: scalar tensor (number of positive pairs contributing to the loss)
         """
         if valid_mask is None:
             mask = (y.abs().sum(dim=-1) > 1e-6)  # heuristic fallback
@@ -48,20 +47,23 @@ class InfoNCEEstimator(MIEstimator):
         y_valid = y[mask]  # (N, Hidden)
 
         if x_valid.shape[0] == 0:
-            zero = torch.tensor(0.0, device=x.device)
-            return zero.requires_grad_(True), zero
+            zero = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+            return zero.requires_grad_(True)
 
         # Normalize
         x_norm = F.normalize(x_valid, p=2, dim=-1)
         y_norm = F.normalize(y_valid, p=2, dim=-1)
+
+        # Align dtypes to avoid matmul failures under mixed precision.
+        common_dtype = torch.promote_types(x_norm.dtype, y_norm.dtype)
+        x_norm = x_norm.to(common_dtype)
+        y_norm = y_norm.to(common_dtype)
 
         logits = torch.mm(x_norm, y_norm.t()) / self.temperature
 
         labels = torch.arange(x_valid.shape[0], device=x.device)
 
         loss = F.cross_entropy(logits, labels)
-
-        
 
         return loss
 
