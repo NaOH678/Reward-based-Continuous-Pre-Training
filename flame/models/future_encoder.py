@@ -134,6 +134,8 @@ class FutureEncoder(nn.Module):
 
         # 3. Attention
         elif self.summary_method == "attention":
+            # Ensure dtype matches projection weights to avoid matmul dtype mismatch under AMP.
+            hidden_states = hidden_states.to(self.q_proj.weight.dtype)
             if self.future_k == -1:
                 q = self.q_proj(hidden_states)
                 k = self.k_proj(hidden_states)
