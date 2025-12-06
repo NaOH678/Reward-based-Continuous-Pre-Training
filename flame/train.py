@@ -657,8 +657,8 @@ def main(job_config: JobConfig):
                         total_loss.backward()
 
                 losses.append(total_loss)
-                ce_losses.append(ce_loss_raw.detach())
-                aux_losses.append(aux_loss.detach())
+                ce_losses.append(ce_loss.detach())
+                aux_losses.append(aux_loss_scaled.detach())
                 # mi_lower_bounds.append(mi_lower_bound.detach())
                 # counts.append(count.detach())
 
