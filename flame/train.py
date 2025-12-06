@@ -187,6 +187,13 @@ def main(job_config: JobConfig):
         trust_remote_code=True,
         model_max_length=int(1e10),
     )
+    if tokenizer.pad_token_id is None:
+        if tokenizer.eos_token is not None:
+            logger.warning("Tokenizer has no pad token, using eos_token as pad_token.")
+            tokenizer.pad_token = tokenizer.eos_token
+        else:
+            logger.warning("Tokenizer has no pad token or eos token; adding [PAD] token.")
+            tokenizer.add_special_tokens({"pad_token": "[PAD]"})
     logger.info(f"{tokenizer}")
     logger.info(
         f"Loading dataset {job_config.training.dataset}"
@@ -249,6 +256,8 @@ def main(job_config: JobConfig):
 
     logger.info(f"Loading model config from {job_config.model.config}")
     model_config = AutoConfig.from_pretrained(job_config.model.config)
+    if getattr(model_config, "pad_token_id", None) is None and tokenizer.pad_token_id is not None:
+        model_config.pad_token_id = tokenizer.pad_token_id
     # set the model configs from training inputs:
     # 1. norm type to decide which norm layer to use
     # 2. disable fused norm if TP is enabled
