@@ -29,6 +29,7 @@ LOG_RANK=0 bash train.sh \
     --future_encoder.enable \
     --future_encoder.future_k '-1' \
     --future_encoder.summary_method attention \
+    --future_encoder.loss_weight 0.1 \
     --checkpoint.interval 1000 \
     --checkpoint.load_step 0 \
     --checkpoint.keep_latest_k 2 \

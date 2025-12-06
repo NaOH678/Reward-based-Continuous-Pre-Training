@@ -598,7 +598,7 @@ def main(job_config: JobConfig):
                             output.loss
                             / job_config.training.gradient_accumulation_steps
                         )
-                        loss = ce_loss
+                        total_loss = ce_loss
                         
                         if future_encoder is not None and mi_estimator is not None:
                             # Extract last hidden state
@@ -607,7 +607,7 @@ def main(job_config: JobConfig):
                             hidden_states = output.hidden_states[-1]
                             future_summaries = future_encoder(hidden_states)
                             aux_loss, log_N = mi_estimator(hidden_states, future_summaries)
-                            loss += aux_loss * job_config.future_encoder.loss_weight
+                            total_loss = ce_loss + aux_loss * job_config.future_encoder.loss_weight
                             
                             # Calculate MI lower bound: I >= log(N) - Loss
                             mi_lower_bound = log_N - aux_loss.detach()
@@ -615,12 +615,13 @@ def main(job_config: JobConfig):
                             aux_loss = torch.tensor(0.0, device=device)
                             mi_lower_bound = torch.tensor(0.0, device=device)
                             
-                        loss.backward()
+                        total_loss.backward()
 
-                losses.append(loss)
+                losses.append(total_loss)
                 ce_losses.append(ce_loss.detach())
                 aux_losses.append(aux_loss.detach())
                 mi_lower_bounds.append(mi_lower_bound.detach())
+
             loss = sum(losses)
             ce_loss_total = sum(ce_losses)
             aux_loss_total = sum(aux_losses)
@@ -680,7 +681,7 @@ def main(job_config: JobConfig):
                     else:
                         global_avg_aux_loss = 0.0
                         global_avg_mi_lb = 0.0
-                        
+                    
                 else:
                     # Scale back the loss before logging
                     global_avg_loss = global_max_loss = loss.item()
