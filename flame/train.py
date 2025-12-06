@@ -523,8 +523,8 @@ def main(job_config: JobConfig):
             losses = []
             ce_losses = []
             aux_losses = []
-            # mi_lower_bounds = []
-            counts = []
+            mi_lower_bounds = []
+            # counts = []
             # do gradient accumulation if enabled
             for _ in range(job_config.training.gradient_accumulation_steps):
                 # get batch
@@ -629,7 +629,7 @@ def main(job_config: JobConfig):
                             future_summaries, future_valid = future_encoder(
                                 hidden_states, attention_mask=attention_mask
                             )
-                            aux_loss, count = mi_estimator(
+                            aux_loss, log_N = mi_estimator(
                                 hidden_states, future_summaries, valid_mask=future_valid
                             )
                             aux_loss_scaled = (
@@ -639,28 +639,25 @@ def main(job_config: JobConfig):
                             )
                             total_loss = ce_loss + aux_loss_scaled
                             
-                            # mi_lower_bound = (
-                            #     torch.log(torch.clamp(count, min=1.0))
-                            #     - aux_loss.detach()
-                            # )
+                            mi_lower_bound = (log_N - aux_loss) * inv_grad_acc_steps
                         else:
                             aux_loss = torch.tensor(0.0, device=device)
-                            # mi_lower_bound = torch.tensor(0.0, device=device)
-                            count = torch.tensor(0.0, device=device)
+                            mi_lower_bound = torch.tensor(0.0, device=device)
+                            # count = torch.tensor(0.0, device=device)
                             
                         total_loss.backward()
 
                 losses.append(total_loss)
                 ce_losses.append(ce_loss_raw.detach())
                 aux_losses.append(aux_loss.detach())
-                # mi_lower_bounds.append(mi_lower_bound.detach())
-                counts.append(count.detach())
+                mi_lower_bounds.append(mi_lower_bound.detach())
+                # counts.append(count.detach())
 
             loss = sum(losses)
             ce_loss_total = sum(ce_losses)
             aux_loss_total = sum(aux_losses)
-            # mi_lower_bound_total = sum(mi_lower_bounds)
-            count_total = sum(counts)
+            mi_lower_bound_total = sum(mi_lower_bounds)
+            # count_total = sum(counts)
 
             # clip gradients
             grad_norm = dist_utils.clip_grad_norm_(
@@ -710,15 +707,11 @@ def main(job_config: JobConfig):
                         ce_loss_total, world_mesh["dp_cp"]
                     )
                     
-                    if job_config.future_encoder.enable:
+                    if job_config.future_encoder.enable:                       
+                        # count = count_total.detach()
+                        # global_count = dist_utils.dist_sum(count, world_mesh["dp_cp"])
                         global_avg_aux_loss = dist_utils.dist_mean(aux_loss_total, world_mesh["dp_cp"])
-                        global_count = count_total.detach()
-                        if dist.is_available() and dist.is_initialized():
-                            dist.all_reduce(global_count, op=dist.ReduceOp.SUM)
-                        global_avg_mi_lb = (
-                            torch.log(torch.clamp(global_count, min=1.0))
-                            - global_avg_aux_loss
-                        )
+                        global_avg_mi_lb = dist_utils.dist_mean(mi_lower_bound_total, world_mesh["dp_cp"])
                     else:
                         global_avg_aux_loss = 0.0
                         global_avg_mi_lb = 0.0
@@ -729,8 +722,7 @@ def main(job_config: JobConfig):
                     global_avg_ce_loss = ce_loss_total.item()
                     if job_config.future_encoder.enable:
                         global_avg_aux_loss = aux_loss_total.item()
-                        global_count = count_total.item()
-                        global_avg_mi_lb = math.log(max(global_count, 1.0)) - global_avg_aux_loss
+                        global_avg_mi_lb = mi_lower_bound_total.item()
                     else:
                         global_avg_aux_loss = 0.0
                         global_avg_mi_lb = 0.0
