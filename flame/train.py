@@ -678,7 +678,14 @@ def main(job_config: JobConfig):
                         )
                         ce_loss_raw = output.loss
                         ce_loss = ce_loss_raw * inv_grad_acc_steps
-                        total_loss = ce_loss
+                        # If action layer is enabled and ce_loss_weight is set (default 0), scale CE accordingly
+                        ce_loss_weight = (
+                            job_config.action_layer.ce_loss_weight
+                            if job_config.action_layer.enable
+                            else 1.0
+                        )
+                        scaled_ce = ce_loss * ce_loss_weight
+                        total_loss = scaled_ce
 
                         aux_loss = torch.tensor(0.0, device=device)
                         aux_loss_scaled = torch.tensor(0.0, device=device)
@@ -701,24 +708,24 @@ def main(job_config: JobConfig):
                                     * inv_grad_acc_steps
                                     * job_config.future_encoder.loss_weight
                                 )
-                                total_loss = total_loss + aux_loss_scaled
+                        total_loss = total_loss + aux_loss_scaled
 
-                            if action_layer is not None:
-                                rl_loss, action_metrics_step = action_layer(
-                                    logits=output.logits,
-                                    hidden_states=hidden_states,
-                                    labels=labels,
-                                    future_summaries=future_summaries,
-                                    future_valid=future_valid,
-                                    embed_weight=model.get_input_embeddings().weight,
-                                    attention_mask=attention_mask,
-                                )
-                                action_loss_scaled = (
-                                    rl_loss
-                                    * inv_grad_acc_steps
-                                    * job_config.action_layer.loss_weight
-                                )
-                                total_loss = total_loss + action_loss_scaled
+                        if action_layer is not None:
+                            rl_loss, action_metrics_step = action_layer(
+                                logits=output.logits,
+                                hidden_states=hidden_states,
+                                labels=labels,
+                                future_summaries=future_summaries,
+                                future_valid=future_valid,
+                                embed_weight=model.get_input_embeddings().weight,
+                                attention_mask=attention_mask,
+                            )
+                            action_loss_scaled = (
+                                rl_loss
+                                * inv_grad_acc_steps
+                                * job_config.action_layer.loss_weight
+                            )
+                            total_loss = total_loss + action_loss_scaled
 
                         total_loss.backward()
 

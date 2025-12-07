@@ -886,6 +886,12 @@ class JobConfig:
             help="Score type for action layer heads when producing rewards.",
         )
         self.parser.add_argument(
+            "--action_layer.ce_loss_weight",
+            type=float,
+            default=0.0,
+            help="Weight for CE loss when action layer is enabled; default 0 to exclude CE from total loss.",
+        )
+        self.parser.add_argument(
             "--action_layer.activation",
             type=str,
             default=None,
