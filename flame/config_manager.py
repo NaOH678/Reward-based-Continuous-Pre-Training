@@ -837,8 +837,8 @@ class JobConfig:
             "--action_layer.head_type",
             type=str,
             default="mlp",
-            choices=["mlp", "cosine", "bilinear"],
-            help="Scoring head type for action layer.",
+            choices=["mlp", "tower"],
+            help="Scoring head type for action layer (cosine/tower are lightweight fusion MLPs).",
         )
         self.parser.add_argument(
             "--action_layer.tau",
@@ -856,6 +856,40 @@ class JobConfig:
             "--action_layer.mean_threshold",
             action="store_true",
             help="If enabled, zero rewards below the mean and re-normalize.",
+        )
+        self.parser.add_argument(
+            "--action_layer.use_rms_norm",
+            action="store_true",
+            help="Use RMSNorm inside action heads (defaults to LayerNorm).",
+        )
+        self.parser.add_argument(
+            "--action_layer.ffn_hidden_size",
+            type=int,
+            default=None,
+            help="FFN hidden size for cosine head; defaults to model.intermediate_size or 2*hidden_size.",
+        )
+        self.parser.add_argument(
+            "--action_layer.residual",
+            action="store_true",
+            help="Enable residual future prediction: F_hat = F + delta(h,e).",
+        )
+        self.parser.add_argument(
+            "--action_layer.delta_init_zero",
+            action="store_true",
+            help="Zero-init delta MLP last layer when residual is enabled.",
+        )
+        self.parser.add_argument(
+            "--action_layer.score_type",
+            type=str,
+            default="cosine",
+            choices=["cosine", "delta_l2"],
+            help="Score type for action layer heads when producing rewards.",
+        )
+        self.parser.add_argument(
+            "--action_layer.activation",
+            type=str,
+            default=None,
+            help="Activation for cosine head FFN (e.g., gelu, silu, swiglu, geglu). Defaults to model hidden_act or gelu.",
         )
         self.parser.add_argument(
             "--action_layer.gt_bias",

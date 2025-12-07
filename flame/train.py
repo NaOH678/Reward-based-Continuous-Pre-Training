@@ -43,6 +43,7 @@ from flame.models.parallelize_fla import parallelize_fla
 from flame.models.pipeline_fla import pipeline_fla
 from flame.models.future_encoder import FutureEncoder
 from flame.models.mi_estimator import build_mi_estimator
+from flame.models.action_layer import ActionLayer
 from flame.tools.utils import get_nparams_and_flops
 
 
@@ -361,6 +362,7 @@ def main(job_config: JobConfig):
     # Initialize Future Encoder and MI Estimator if enabled
     future_encoder = None
     mi_estimator = None
+    action_layer = None
     if job_config.future_encoder.enable:
         logger.info("Initializing Future Encoder and MI Estimator...")
         future_encoder = FutureEncoder(
@@ -396,8 +398,50 @@ def main(job_config: JobConfig):
                     if device.type == "cuda"
                     else {}
                 )
-                mi_estimator = DDP(mi_estimator, broadcast_buffers=False, **ddp_kwargs)
+            mi_estimator = DDP(mi_estimator, broadcast_buffers=False, **ddp_kwargs)
             model_parts.append(mi_estimator)
+
+    if job_config.action_layer.enable:
+        if not job_config.future_encoder.enable:
+            raise ValueError("Action layer requires future_encoder.enable for future summaries.")
+        use_rms_norm = job_config.action_layer.use_rms_norm
+        if not use_rms_norm:
+            use_rms_norm = bool(
+                getattr(model_config, "norm_type", "").lower() == "rmsnorm"
+                or hasattr(model_config, "rms_norm_eps")
+            )
+        ffn_hidden_size = job_config.action_layer.ffn_hidden_size
+        if ffn_hidden_size is None:
+            ffn_hidden_size = getattr(model_config, "intermediate_size", None)
+        activation = job_config.action_layer.activation
+        if activation is None:
+            activation = getattr(model_config, "hidden_act", None)
+        action_layer = ActionLayer(
+            hidden_size=model_config.hidden_size,
+            top_k=job_config.action_layer.top_k,
+            head_type=job_config.action_layer.head_type,
+            tau=job_config.action_layer.tau,
+            reward_clamp=job_config.action_layer.reward_clamp,
+            mean_threshold=job_config.action_layer.mean_threshold,
+            gt_bias=job_config.action_layer.gt_bias,
+            use_rms_norm=use_rms_norm,
+            ffn_hidden_size=ffn_hidden_size,
+            activation=activation,
+            residual=job_config.action_layer.residual,
+            delta_init_zero=job_config.action_layer.delta_init_zero,
+            score_type=job_config.action_layer.score_type,
+        )
+        action_layer.to(init_device)
+        action_layer.train()
+        if len(list(action_layer.parameters())) > 0:
+            if parallel_dims.dp_replicate_enabled:
+                ddp_kwargs = (
+                    {"device_ids": [device.index], "output_device": device.index}
+                    if device.type == "cuda"
+                    else {}
+                )
+                action_layer = DDP(action_layer, broadcast_buffers=False, **ddp_kwargs)
+            model_parts.append(action_layer)
 
     device_mem_stats = device_memory_monitor.get_peak_stats()
     logger.info(
@@ -532,6 +576,9 @@ def main(job_config: JobConfig):
             losses = []
             ce_losses = []
             aux_losses = []
+            action_losses = []
+            action_metrics_acc = {}
+            action_metrics_count = 0
             # mi_lower_bounds = []
             # counts = []
             # do gradient accumulation if enabled
@@ -632,39 +679,73 @@ def main(job_config: JobConfig):
                         ce_loss_raw = output.loss
                         ce_loss = ce_loss_raw * inv_grad_acc_steps
                         total_loss = ce_loss
-                        
-                        if future_encoder is not None and mi_estimator is not None:
+
+                        aux_loss = torch.tensor(0.0, device=device)
+                        aux_loss_scaled = torch.tensor(0.0, device=device)
+                        action_loss_scaled = torch.tensor(0.0, device=device)
+                        action_metrics_step = None
+                        future_summaries = None
+                        future_valid = None
+
+                        if future_encoder is not None:
                             hidden_states = output.hidden_states[-1]
                             future_summaries, future_valid = future_encoder(
                                 hidden_states, attention_mask=attention_mask
                             )
-                            aux_loss = mi_estimator(
-                                hidden_states, future_summaries, valid_mask=future_valid
-                            )
-                            aux_loss_scaled = (
-                                aux_loss
-                                * inv_grad_acc_steps
-                                * job_config.future_encoder.loss_weight
-                            )
-                            total_loss = ce_loss + aux_loss_scaled
-                            
-                            # mi_lower_bound = (log_N - aux_loss) * inv_grad_acc_steps
-                        else:
-                            aux_loss = torch.tensor(0.0, device=device)
-                            mi_lower_bound = torch.tensor(0.0, device=device)
-                            # count = torch.tensor(0.0, device=device)
-                            
+                            if mi_estimator is not None:
+                                aux_loss = mi_estimator(
+                                    hidden_states, future_summaries, valid_mask=future_valid
+                                )
+                                aux_loss_scaled = (
+                                    aux_loss
+                                    * inv_grad_acc_steps
+                                    * job_config.future_encoder.loss_weight
+                                )
+                                total_loss = total_loss + aux_loss_scaled
+
+                            if action_layer is not None:
+                                rl_loss, action_metrics_step = action_layer(
+                                    logits=output.logits,
+                                    hidden_states=hidden_states,
+                                    labels=labels,
+                                    future_summaries=future_summaries,
+                                    future_valid=future_valid,
+                                    embed_weight=model.get_input_embeddings().weight,
+                                    attention_mask=attention_mask,
+                                )
+                                action_loss_scaled = (
+                                    rl_loss
+                                    * inv_grad_acc_steps
+                                    * job_config.action_layer.loss_weight
+                                )
+                                total_loss = total_loss + action_loss_scaled
+
                         total_loss.backward()
 
                 losses.append(total_loss)
                 ce_losses.append(ce_loss.detach())
                 aux_losses.append(aux_loss_scaled.detach())
+                action_losses.append(action_loss_scaled.detach())
+                if action_metrics_step is not None:
+                    for k, v in action_metrics_step.items():
+                        action_metrics_acc[k] = action_metrics_acc.get(k, 0.0) + v.detach()
+                    action_metrics_count += 1
                 # mi_lower_bounds.append(mi_lower_bound.detach())
                 # counts.append(count.detach())
 
             loss = sum(losses)
             ce_loss_total = sum(ce_losses)
             aux_loss_total = sum(aux_losses)
+            action_loss_total = sum(action_losses)
+            if action_metrics_count > 0:
+                action_metrics_avg = {
+                    k: v / action_metrics_count for k, v in action_metrics_acc.items()
+                }
+            else:
+                action_metrics_avg = {
+                    k: torch.tensor(0.0, device=device)
+                    for k in ["avg_reward", "max_reward", "avg_action_size"]
+                }
             # mi_lower_bound_total = sum(mi_lower_bounds)
             # count_total = sum(counts)
 
@@ -700,6 +781,7 @@ def main(job_config: JobConfig):
                     loss = loss.detach()
                     ce_loss_total = ce_loss_total.detach()
                     aux_loss_total = aux_loss_total.detach()
+                    action_loss_total = action_loss_total.detach()
                     # mi_lower_bound_total = mi_lower_bound_total.detach()
                     # Use dist_mean/max on the accumulated loss for the step
                     global_avg_loss, global_max_loss = (
@@ -724,6 +806,22 @@ def main(job_config: JobConfig):
                     else:
                         global_avg_aux_loss = 0.0
                         global_avg_mi_lb = 0.0
+                    if job_config.action_layer.enable:
+                        global_avg_action_loss = dist_utils.dist_mean(action_loss_total, world_mesh["dp_cp"])
+                        global_avg_action_reward = dist_utils.dist_mean(
+                            action_metrics_avg["avg_reward"].detach(), world_mesh["dp_cp"]
+                        )
+                        global_avg_action_size = dist_utils.dist_mean(
+                            action_metrics_avg["avg_action_size"].detach(), world_mesh["dp_cp"]
+                        )
+                        global_max_action_reward = dist_utils.dist_max(
+                            action_metrics_avg["max_reward"].detach(), world_mesh["dp_cp"]
+                        )
+                    else:
+                        global_avg_action_loss = 0.0
+                        global_avg_action_reward = 0.0
+                        global_avg_action_size = 0.0
+                        global_max_action_reward = 0.0
                     
                 else:
                     # Scale back the loss before logging
@@ -735,6 +833,16 @@ def main(job_config: JobConfig):
                     else:
                         global_avg_aux_loss = 0.0
                         # global_avg_mi_lb = 0.0
+                    if job_config.action_layer.enable:
+                        global_avg_action_loss = action_loss_total.item()
+                        global_avg_action_reward = action_metrics_avg["avg_reward"].item()
+                        global_avg_action_size = action_metrics_avg["avg_action_size"].item()
+                        global_max_action_reward = action_metrics_avg["max_reward"].item()
+                    else:
+                        global_avg_action_loss = 0.0
+                        global_avg_action_reward = 0.0
+                        global_avg_action_size = 0.0
+                        global_max_action_reward = 0.0
 
                 # Update train state tokens and elapsed time
                 time_now = time.perf_counter()
@@ -768,6 +876,11 @@ def main(job_config: JobConfig):
                 if job_config.future_encoder.enable:
                     extra_metrics["aux_loss"] = global_avg_aux_loss
                     # extra_metrics["mi_lower_bound"] = global_avg_mi_lb
+                if job_config.action_layer.enable:
+                    extra_metrics["action_loss"] = global_avg_action_loss
+                    extra_metrics["action_avg_reward"] = global_avg_action_reward
+                    extra_metrics["action_avg_size"] = global_avg_action_size
+                    extra_metrics["action_max_reward"] = global_max_action_reward
 
                 metric_logger.log(
                     train_state.step,

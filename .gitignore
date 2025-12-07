@@ -4,7 +4,10 @@ test.py
 # data files
 data
 
-# bash scripts
+# reference codes
+avataRL
+3rdparty
+# shell scripts
 *.sh
 
 # docs
