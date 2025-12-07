@@ -80,6 +80,33 @@ def _log_sample_preview(dataset, tokenizer, color, max_chars: int = 400, max_tok
         except Exception as exc:
             logger.warning(f"Failed to tokenize preview sample: {exc}")
 
+_MODEL_CONVERTER_HOOK_MODEL_PARTS = None
+_MODEL_CONVERTERS = None
+
+
+def _optimizer_post_step_hook(*args, **kwargs):
+    if _MODEL_CONVERTER_HOOK_MODEL_PARTS is None or _MODEL_CONVERTERS is None:
+        return
+    _MODEL_CONVERTERS.post_optimizer_hook(_MODEL_CONVERTER_HOOK_MODEL_PARTS)
+
+
+def _ensure_cloudpickle_for_dist_objects():
+    """Allow torch.distributed collectives to serialize complex Python objects."""
+
+    try:
+        import cloudpickle  # type: ignore
+    except ModuleNotFoundError:  # pragma: no cover - optional dependency missing
+        logger.warning(
+            "cloudpickle is not installed; distributed checkpoint coordination may fail "
+            "when planner state contains non-picklable objects."
+        )
+        return
+
+    import torch.distributed.distributed_c10d as dist_c10d
+
+    if getattr(dist_c10d, "_pickler", None) is not cloudpickle.CloudPickler:
+        logger.info("Enabling cloudpickle for distributed object collectives")
+        dist_c10d._pickler = cloudpickle.CloudPickler  # type: ignore[attr-defined]
 
 def build_tokenizer(job_config: JobConfig) -> AutoTokenizer:
     return AutoTokenizer.from_pretrained(job_config.model.tokenizer_path)
@@ -302,6 +329,8 @@ def main(job_config: JobConfig):
     # Build the collection of model converters. No-op if `model.converters` empty
     model_converters = build_model_converters(job_config, parallel_dims)
     model_converters.convert(model)
+    global _MODEL_CONVERTERS
+    _MODEL_CONVERTERS = model_converters
 
     # calculate model size and flops per token
     model_param_count, num_flops_per_token = get_nparams_and_flops(
@@ -456,9 +485,9 @@ def main(job_config: JobConfig):
     # Post optimizer step model converters hook.
     # e.g. calculate float8 dynamic amax/scale for all-parameter for FSDP2
     # where it issues a single all-reduce for all parameters at once for better performance
-    optimizers.register_step_post_hook(
-        lambda *args, **kwargs: model_converters.post_optimizer_hook(model_parts)
-    )
+    global _MODEL_CONVERTER_HOOK_MODEL_PARTS
+    _MODEL_CONVERTER_HOOK_MODEL_PARTS = model_parts
+    optimizers.register_step_post_hook(_optimizer_post_step_hook)
 
     train_state = TrainState()
 
@@ -472,6 +501,8 @@ def main(job_config: JobConfig):
         job_config=job_config,
         ft_manager=ft_manager,
     )
+    
+    _ensure_cloudpickle_for_dist_objects()
 
     if job_config.checkpoint.create_seed_checkpoint:
         assert world_size == 1, (
