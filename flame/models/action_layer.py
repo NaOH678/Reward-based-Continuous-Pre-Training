@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed.tensor import DTensor, Replicate
 
 try:
     RMSNorm = nn.RMSNorm  # type: ignore[attr-defined]
@@ -52,6 +53,9 @@ class ActionLayer(nn.Module):
         self.residual = residual
         self.delta_init_zero = delta_init_zero
         self.score_type = score_type
+        # Cache for already-localized embedding weights to avoid repeated DTensor->local conversions.
+        self._cached_embed_src = None
+        self._cached_embed_local = None
 
         head_type = head_type.lower()
         self.head_type = head_type
@@ -156,6 +160,18 @@ class ActionLayer(nn.Module):
             loss: scalar tensor
             metrics: dict of torch scalars
         """
+        # Avoid mixed DTensor/Tensor in embedding lookup.
+        if isinstance(embed_weight, DTensor):
+            if embed_weight is not self._cached_embed_src:
+                if any(not isinstance(p, Replicate) for p in embed_weight.placements):
+                    embed_weight = embed_weight.redistribute(
+                        embed_weight.device_mesh,
+                        placements=[Replicate()] * embed_weight.ndim,
+                    )
+                self._cached_embed_src = embed_weight
+                self._cached_embed_local = embed_weight.to_local()
+            embed_weight = self._cached_embed_local
+
         bsz, seq_len, vocab_size = logits.shape
         hidden_size = hidden_states.size(-1)
         logits_flat = logits.view(-1, vocab_size)
