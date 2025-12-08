@@ -194,18 +194,29 @@ class ActionLayer(nn.Module):
         future_expanded = future_flat.unsqueeze(1).expand_as(token_embeds)
 
         if self.head_type == "mlp":
-            fused = torch.cat([hidden_expanded, token_embeds], dim=-1)  # (B*T, A, 2H)
+            compute_dtype = torch.promote_types(
+                hidden_expanded.dtype, self.cos_mlp[0].weight.dtype
+            )
+            fused = torch.cat([hidden_expanded, token_embeds], dim=-1).to(compute_dtype)  # (B*T, A, 2H)
+            future_expanded_cast = future_expanded.to(compute_dtype)
             delta = self.cos_mlp(fused)  # (B*T, A, H)
-            action_repr = future_expanded + delta if self.residual else delta
-            scores = self._compute_scores(action_repr, future_expanded)
+            action_repr = future_expanded_cast + delta if self.residual else delta
+            scores = self._compute_scores(action_repr, future_expanded_cast)
         elif self.head_type == "tower":
+            compute_dtype = torch.promote_types(
+                hidden_expanded.dtype, self.tower_h.weight.dtype
+            )
+            hidden_expanded = hidden_expanded.to(compute_dtype)
+            token_embeds = token_embeds.to(compute_dtype)
+            future_expanded_cast = future_expanded.to(compute_dtype)
+
             h_proj = self.tower_h(hidden_expanded)
             e_proj = self.tower_e(token_embeds)
             sim = h_proj * e_proj
             fused = torch.cat([h_proj, e_proj, sim], dim=-1)
             delta = self.tower_mlp(fused)
-            action_repr = future_expanded + delta if self.residual else delta
-            scores = self._compute_scores(action_repr, future_expanded)
+            action_repr = future_expanded_cast + delta if self.residual else delta
+            scores = self._compute_scores(action_repr, future_expanded_cast)
         else:
             raise NotImplementedError
         
