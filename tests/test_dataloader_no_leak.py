@@ -19,6 +19,8 @@ class FakeTokenizer:
         attention_mask = []
         for x in batch:
             ids = x["input_ids"]
+            if isinstance(ids, torch.Tensor):
+                ids = ids.tolist()
             pad_len = max_len - len(ids)
             input_ids.append(ids + [self.pad_token_id] * pad_len)
             attention_mask.append([1] * len(ids) + [0] * pad_len)
