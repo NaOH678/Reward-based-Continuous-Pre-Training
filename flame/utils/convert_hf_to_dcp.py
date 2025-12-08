@@ -34,6 +34,14 @@ def convert_hf_weights(
         model, trust_remote_code=trust_remote_code
     )
     state_dict = model.state_dict()
+    # Infer defaults to mirror training when flags are not provided explicitly.
+    inferred_action_ffn_hidden_size = action_ffn_hidden_size or getattr(
+        model.config, "intermediate_size", None
+    )
+    inferred_action_use_rms_norm = action_use_rms_norm or bool(
+        getattr(model.config, "norm_type", "").lower() == "rmsnorm"
+        or hasattr(model.config, "rms_norm_eps")
+    )
 
     if include_future_encoder:
         logger.info(
@@ -55,15 +63,16 @@ def convert_hf_weights(
                 "Including ActionLayer without FutureEncoder; ensure you supply future summaries during training."
             )
         logger.info(
-            "Including ActionLayer parameters (head_type=%s, use_rms_norm=%s)",
+            "Including ActionLayer parameters (head_type=%s, use_rms_norm=%s, ffn_hidden_size=%s)",
             action_head_type,
-            action_use_rms_norm,
+            inferred_action_use_rms_norm,
+            inferred_action_ffn_hidden_size,
         )
         action_layer = ActionLayer(
             hidden_size=model.config.hidden_size,
             head_type=action_head_type,
-            use_rms_norm=action_use_rms_norm,
-            ffn_hidden_size=action_ffn_hidden_size,
+            use_rms_norm=inferred_action_use_rms_norm,
+            ffn_hidden_size=inferred_action_ffn_hidden_size,
         )
         state_dict.update(action_layer.state_dict())
         logger.info("ActionLayer parameters added to checkpoint.")
