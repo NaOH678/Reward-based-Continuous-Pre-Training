@@ -727,8 +727,10 @@ def main(job_config: JobConfig):
 
                         if future_encoder is not None:
                             hidden_states = output.hidden_states[-1]
+                            # Stop gradients from future branch flowing back into the LM by detaching inputs,
+                            # but keep graph for future_encoder itself so it can be trained.
                             future_summaries, future_valid = future_encoder(
-                                hidden_states, attention_mask=attention_mask
+                                hidden_states.detach(), attention_mask=attention_mask
                             )
                             if mi_estimator is not None:
                                 aux_loss = mi_estimator(
@@ -739,6 +741,7 @@ def main(job_config: JobConfig):
                                     * inv_grad_acc_steps
                                     * job_config.future_encoder.loss_weight
                                 )
+                            future_summaries_detached = future_summaries.detach()
                         total_loss = total_loss + aux_loss_scaled
 
                         if action_layer is not None:
@@ -746,7 +749,7 @@ def main(job_config: JobConfig):
                                 logits=output.logits,
                                 hidden_states=hidden_states,
                                 labels=labels,
-                                future_summaries=future_summaries,
+                                future_summaries=future_summaries_detached if future_encoder is not None else None,
                                 future_valid=future_valid,
                                 embed_weight=model.get_input_embeddings().weight,
                                 attention_mask=attention_mask,

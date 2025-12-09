@@ -7,6 +7,7 @@ data
 # reference codes
 avataRL
 3rdparty
+lm-evaluation-harness
 # shell scripts
 *.sh
 
