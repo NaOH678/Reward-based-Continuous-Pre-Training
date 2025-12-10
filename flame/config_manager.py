@@ -821,6 +821,95 @@ class JobConfig:
             help="Weight of the auxiliary Future Encoder loss.",
         )
 
+        # action layer configs
+        self.parser.add_argument(
+            "--action_layer.enable",
+            action="store_true",
+            help="Whether to enable the future-aware token-level action layer.",
+        )
+        self.parser.add_argument(
+            "--action_layer.top_k",
+            type=int,
+            default=16,
+            help="Top-k from student logits to form the action set (plus ground truth).",
+        )
+        self.parser.add_argument(
+            "--action_layer.head_type",
+            type=str,
+            default="mlp",
+            choices=["mlp", "tower"],
+            help="Scoring head type for action layer (cosine/tower are lightweight fusion MLPs).",
+        )
+        self.parser.add_argument(
+            "--action_layer.tau",
+            type=float,
+            default=1.0,
+            help="Temperature for reward softmax over the action set.",
+        )
+        self.parser.add_argument(
+            "--action_layer.reward_clamp",
+            type=float,
+            default=None,
+            help="If set, clamp reward values before re-normalization.",
+        )
+        self.parser.add_argument(
+            "--action_layer.mean_threshold",
+            action="store_true",
+            help="If enabled, zero rewards below the mean and re-normalize.",
+        )
+        self.parser.add_argument(
+            "--action_layer.use_rms_norm",
+            action="store_true",
+            help="Use RMSNorm inside action heads (defaults to LayerNorm).",
+        )
+        self.parser.add_argument(
+            "--action_layer.ffn_hidden_size",
+            type=int,
+            default=None,
+            help="FFN hidden size for cosine head; defaults to model.intermediate_size or 2*hidden_size.",
+        )
+        self.parser.add_argument(
+            "--action_layer.residual",
+            action="store_true",
+            help="Enable residual future prediction: F_hat = F + delta(h,e).",
+        )
+        self.parser.add_argument(
+            "--action_layer.delta_init_zero",
+            action="store_true",
+            help="Zero-init delta MLP last layer when residual is enabled.",
+        )
+        self.parser.add_argument(
+            "--action_layer.score_type",
+            type=str,
+            default="cosine",
+            choices=["cosine", "delta_l2"],
+            help="Score type for action layer heads when producing rewards.",
+        )
+        self.parser.add_argument(
+            "--action_layer.ce_loss_weight",
+            type=float,
+            default=0.0,
+            help="Weight for CE loss when action layer is enabled; default 0 to exclude CE from total loss.",
+        )
+        self.parser.add_argument(
+            "--action_layer.activation",
+            type=str,
+            default=None,
+            help="Activation for cosine head FFN (e.g., gelu, silu, swiglu, geglu). Defaults to model hidden_act or gelu.",
+        )
+        self.parser.add_argument(
+            "--action_layer.gt_bias",
+            type=float,
+            default=0.0,
+            help="Additive bias to scores of ground-truth tokens inside the action set.",
+        )
+        self.parser.add_argument(
+            "--action_layer.loss_weight",
+            type=float,
+            default=0.1,
+            help="Weight of the action layer loss.",
+        )
+
         # float8 configs
         self.parser.add_argument(
             "--float8.enable_fsdp_float8_all_gather",
@@ -953,6 +1042,35 @@ class JobConfig:
         string_list_argnames = self._get_string_list_argument_names()
         for n in string_list_argnames:
             check_string_list_argument(args_dict, n)
+
+        # Flatten nested lists produced by argparse when using string_list with nargs="*"
+        for n in string_list_argnames:
+            section, name = n.split(".")
+            val = args_dict.get(section, {}).get(name, None)
+            if isinstance(val, list) and any(isinstance(v, list) for v in val):
+                flat = []
+                for v in val:
+                    flat.extend(v if isinstance(v, list) else [v])
+                args_dict[section][name] = flat
+        # Normalize common aliases for checkpoint.exclude_from_loading so they match CheckpointManager keys
+        ckpt = args_dict.get("checkpoint", {})
+        if "exclude_from_loading" in ckpt and isinstance(ckpt["exclude_from_loading"], list):
+            mapping = {
+                "optimizer": "optimizers",
+                "lr_scheduler": "lr_schedulers",
+                "dataloaders": "dataloader",
+                "dataloader": "dataloader",
+                "train_states": "train_state",
+                "train_state": "train_state",
+            }
+            normalized = []
+            seen = set()
+            for item in ckpt["exclude_from_loading"]:
+                key = mapping.get(item, item)
+                if key not in seen:
+                    normalized.append(key)
+                    seen.add(key)
+            ckpt["exclude_from_loading"] = normalized
 
         # override args dict with cmd_args
         cmd_args_dict = self._args_to_two_level_dict(cmd_args)
