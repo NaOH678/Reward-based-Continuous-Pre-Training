@@ -57,6 +57,8 @@ class FuturePredictorHead(nn.Module):
         Returns:
             normalized predicted future embedding h'_t: (B, T, H)
         """
+        # Align input dtype with LayerNorm params to avoid mixed bf16/fp32 issues.
+        x = x.to(self.ln.weight.dtype)
         x_norm = self.ln(x)
         if self.head_type == "linear":
             h = self.proj(x_norm)
