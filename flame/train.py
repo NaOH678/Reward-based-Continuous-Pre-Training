@@ -9,6 +9,7 @@ import math
 import os
 import time
 from datetime import timedelta
+from contextlib import nullcontext
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -521,8 +522,19 @@ def main(job_config: JobConfig):
         f"({device_mem_stats.max_reserved_pct:.2f}%)"
     )
 
+    freeze_lm_for_infonce = getattr(job_config.experimental, "freeze_lm_for_infonce", False)
+    if freeze_lm_for_infonce:
+        logger.info("Freezing LM parameters and skipping CE loss (InfoNCE-only sanity check).")
+        for p in model_parts[0].parameters():
+            p.requires_grad = False
+
     # build optimizer after applying parallelisms to the model
-    optimizers = train_spec.build_optimizers_fn(model_parts, job_config, ft_manager)
+    optim_model_parts = (
+        [m for m in model_parts if any(p.requires_grad for p in m.parameters(recurse=True))]
+        if freeze_lm_for_infonce
+        else model_parts
+    )
+    optimizers = train_spec.build_optimizers_fn(optim_model_parts, job_config, ft_manager)
     lr_schedulers = train_spec.build_lr_schedulers_fn(optimizers, job_config)
     # Post optimizer step model converters hook.
     # e.g. calculate float8 dynamic amax/scale for all-parameter for FSDP2
@@ -740,22 +752,31 @@ def main(job_config: JobConfig):
                 else:
                     # Non-PP forward / backward
                     with train_context(optional_context_parallel_ctx):
-                        with maybe_enable_amp:
-                            output = model(
-                                input_ids=input_ids,
-                                labels=labels,
-                                position_ids=position_ids,
-                                attention_mask=attention_mask,
-                                cu_seqlens=cu_seqlens,
-                                output_hidden_states=job_config.future_encoder.enable,
-                            )
-                            ce_loss_raw = output.loss
+                        lm_forward_ctx = torch.no_grad() if freeze_lm_for_infonce else nullcontext()
+                        forward_kwargs = dict(
+                            input_ids=input_ids,
+                            position_ids=position_ids,
+                            attention_mask=attention_mask,
+                            cu_seqlens=cu_seqlens,
+                            output_hidden_states=job_config.future_encoder.enable,
+                            use_cache=False,
+                        )
+                        if not freeze_lm_for_infonce:
+                            forward_kwargs["labels"] = labels
+                        with lm_forward_ctx, maybe_enable_amp:
+                            output = model(**forward_kwargs)
+                            if freeze_lm_for_infonce:
+                                ce_loss_raw = torch.tensor(
+                                    0.0, device=device, dtype=output.logits.dtype
+                                )
+                            else:
+                                ce_loss_raw = output.loss
                             ce_loss = ce_loss_raw * inv_grad_acc_steps
                         # If action layer is enabled and ce_loss_weight is set (default 0), scale CE accordingly
                         ce_loss_weight = (
                             job_config.action_layer.ce_loss_weight
-                            if job_config.action_layer.enable
-                            else 1.0
+                            if job_config.action_layer.enable and not freeze_lm_for_infonce
+                            else (0.0 if freeze_lm_for_infonce else 1.0)
                         )
                         scaled_ce = ce_loss * ce_loss_weight
                         total_loss = scaled_ce

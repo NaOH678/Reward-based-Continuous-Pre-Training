@@ -621,6 +621,11 @@ class JobConfig:
                 dotted import module  (e.g., some_package.model_x).
             """,
         )
+        self.parser.add_argument(
+            "--experimental.freeze_lm_for_infonce",
+            action="store_true",
+            help="Freeze the LM backbone and skip CE loss; only train future predictor/MI head for sanity checks.",
+        )
         # checkpointing configs
         self.parser.add_argument(
             "--checkpoint.enable_checkpoint",
