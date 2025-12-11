@@ -41,8 +41,8 @@ from flame.config_manager import JobConfig
 from flame.data import build_dataloader, build_dataset
 from flame.models.parallelize_fla import parallelize_fla
 from flame.models.pipeline_fla import pipeline_fla
-from flame.models.future_encoder import FutureEncoder
 from flame.models.mi_estimator import build_mi_estimator
+from flame.models.future_predictor import FuturePredictorHead
 from flame.models.action_layer import ActionLayer
 from flame.tools.utils import get_nparams_and_flops
 
@@ -107,6 +107,47 @@ def _ensure_cloudpickle_for_dist_objects():
     if getattr(dist_c10d, "_pickler", None) is not cloudpickle.CloudPickler:
         logger.info("Enabling cloudpickle for distributed object collectives")
         dist_c10d._pickler = cloudpickle.CloudPickler  # type: ignore[attr-defined]
+
+
+def build_future_attention_mask(
+    attention_mask: torch.Tensor, dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Build a padding-aware anti-causal attention mask and a validity mask for InfoNCE.
+
+    Args:
+        attention_mask: (B, T) with 1 for valid tokens, 0 for padding.
+        dtype: dtype to use for the additive mask.
+    Returns:
+        future_attn_mask: (B, 1, T, T) additive mask, 0 where attending is allowed, large negative elsewhere.
+        future_valid: (B, T) bool mask where at least one valid future token exists.
+    """
+    bsz, seqlen = attention_mask.shape
+    device = attention_mask.device
+    # Use a finite negative to avoid inf/NaN under mixed precision.
+    neg_inf = torch.tensor(-1e4, device=device, dtype=dtype)
+
+    # Future-only mask: allow attending to positions strictly greater than t.
+    future_only = torch.triu(
+        torch.ones((seqlen, seqlen), device=device, dtype=torch.bool), diagonal=1
+    )
+    future_mask = torch.full(
+        (1, 1, seqlen, seqlen), fill_value=neg_inf.item(), device=device, dtype=dtype
+    )
+    future_mask = future_mask.masked_fill(future_only.unsqueeze(0).unsqueeze(0), 0.0)
+    future_mask = future_mask.expand(bsz, -1, -1, -1).contiguous()
+
+    if attention_mask is not None:
+        pad_mask = (attention_mask == 0).to(dtype=dtype)
+        future_mask = future_mask + pad_mask[:, None, None, :] * neg_inf
+
+    # Valid positions are non-pad tokens that have at least one future valid token.
+    token_lens = attention_mask.sum(dim=1)
+    max_valid_index = torch.clamp(token_lens - 1, min=0)  # last index with a future
+    positions = torch.arange(seqlen, device=device).unsqueeze(0)
+    future_valid = (positions < max_valid_index.unsqueeze(1)) & attention_mask.bool()
+
+    return future_mask, future_valid
 
 def build_tokenizer(job_config: JobConfig) -> AutoTokenizer:
     return AutoTokenizer.from_pretrained(job_config.model.tokenizer_path)
@@ -388,31 +429,32 @@ def main(job_config: JobConfig):
 
         model_parts = [model]
 
-    # Initialize Future Encoder and MI Estimator if enabled
-    future_encoder = None
+    # Initialize Future predictor and MI Estimator if enabled
     mi_estimator = None
+    future_predictor = None
     action_layer = None
     if job_config.future_encoder.enable:
-        logger.info("Initializing Future Encoder and MI Estimator...")
-        future_encoder = FutureEncoder(
-            hidden_size=model_config.hidden_size,
-            future_k=job_config.future_encoder.future_k,
-            summary_method=job_config.future_encoder.summary_method,
-        )
-        future_encoder.to(init_device)
-        future_encoder.train()
-        if len(list(future_encoder.parameters())) > 0:
-            if parallel_dims.dp_replicate_enabled:
-                ddp_kwargs = (
-                    {"device_ids": [device.index], "output_device": device.index}
-                    if device.type == "cuda"
-                    else {}
-                )
-                future_encoder = DDP(
-                    future_encoder, broadcast_buffers=False, **ddp_kwargs
-                )
-            model_parts.append(future_encoder)
-        
+        logger.info("Initializing Future Predictor and MI Estimator...")
+        if job_config.future_predictor.enable:
+            future_predictor = FuturePredictorHead(
+                hidden_size=model_config.hidden_size,
+                head_type=job_config.future_predictor.head_type,
+                dropout=job_config.future_predictor.dropout,
+            )
+            future_predictor.to(init_device)
+            future_predictor.train()
+            if len(list(future_predictor.parameters())) > 0:
+                if parallel_dims.dp_replicate_enabled:
+                    ddp_kwargs = (
+                        {"device_ids": [device.index], "output_device": device.index}
+                        if device.type == "cuda"
+                        else {}
+                    )
+                    future_predictor = DDP(
+                        future_predictor, broadcast_buffers=False, **ddp_kwargs
+                    )
+                model_parts.append(future_predictor)
+
         mi_estimator = build_mi_estimator(
             estimator_type=job_config.future_encoder.estimator_type,
             hidden_size=model_config.hidden_size,
@@ -706,9 +748,9 @@ def main(job_config: JobConfig):
                                 attention_mask=attention_mask,
                                 cu_seqlens=cu_seqlens,
                                 output_hidden_states=job_config.future_encoder.enable,
-                        )
-                        ce_loss_raw = output.loss
-                        ce_loss = ce_loss_raw * inv_grad_acc_steps
+                            )
+                            ce_loss_raw = output.loss
+                            ce_loss = ce_loss_raw * inv_grad_acc_steps
                         # If action layer is enabled and ce_loss_weight is set (default 0), scale CE accordingly
                         ce_loss_weight = (
                             job_config.action_layer.ce_loss_weight
@@ -724,32 +766,49 @@ def main(job_config: JobConfig):
                         action_metrics_step = None
                         future_summaries = None
                         future_valid = None
+                        future_summaries_detached = None
 
-                        if future_encoder is not None:
+                        if job_config.future_encoder.enable:
                             hidden_states = output.hidden_states[-1]
-                            # Stop gradients from future branch flowing back into the LM by detaching inputs,
-                            # but keep graph for future_encoder itself so it can be trained.
-                            future_summaries, future_valid = future_encoder(
-                                hidden_states.detach(), attention_mask=attention_mask
-                            )
-                            if mi_estimator is not None:
-                                aux_loss = mi_estimator(
-                                    hidden_states, future_summaries, valid_mask=future_valid
+                            if attention_mask is not None:
+                                # Build anti-causal mask that still respects padding.
+                                future_attn_mask, future_valid = build_future_attention_mask(
+                                    attention_mask, dtype=hidden_states.dtype
                                 )
-                                aux_loss_scaled = (
-                                    aux_loss
-                                    * inv_grad_acc_steps
-                                    * job_config.future_encoder.loss_weight
-                                )
-                            future_summaries_detached = future_summaries.detach()
+                                with torch.no_grad():
+                                    future_output = model(
+                                        input_ids=input_ids,
+                                        position_ids=position_ids,
+                                        attention_mask=future_attn_mask,
+                                        cu_seqlens=cu_seqlens,
+                                        output_hidden_states=True,
+                                        use_cache=False,
+                                    )
+                                    future_summaries = future_output.hidden_states[-1].detach()
+                                    future_summaries_detached = future_summaries.detach()
+
+                                if mi_estimator is not None and future_predictor is not None:
+                                    predicted_future = future_predictor(hidden_states)
+                                    aux_loss = mi_estimator(
+                                        predicted_future, future_summaries, valid_mask=future_valid
+                                    )
+                                    aux_loss_scaled = (
+                                        aux_loss
+                                        * inv_grad_acc_steps
+                                        * job_config.future_encoder.loss_weight
+                                    )
+                            else:
+                                future_summaries_detached = None
                         total_loss = total_loss + aux_loss_scaled
 
                         if action_layer is not None:
+                            if future_summaries_detached is None:
+                                raise ValueError("Future summaries are required for the action layer but were not computed.")
                             rl_loss, action_metrics_step = action_layer(
                                 logits=output.logits,
                                 hidden_states=hidden_states,
                                 labels=labels,
-                                future_summaries=future_summaries_detached if future_encoder is not None else None,
+                                future_summaries=future_summaries_detached,
                                 future_valid=future_valid,
                                 embed_weight=model.get_input_embeddings().weight,
                                 attention_mask=attention_mask,

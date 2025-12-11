@@ -8,6 +8,7 @@ data
 avataRL
 3rdparty
 lm-evaluation-harness
+check_future_mask.py
 # shell scripts
 *.sh
 

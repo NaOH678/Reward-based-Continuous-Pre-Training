@@ -821,6 +821,27 @@ class JobConfig:
             help="Weight of the auxiliary Future Encoder loss.",
         )
 
+        # future predictor configs
+        self.parser.add_argument(
+            "--future_predictor.enable",
+            action="store_true",
+            default=True,
+            help="Whether to enable the future predictor head (used with future MI loss).",
+        )
+        self.parser.add_argument(
+            "--future_predictor.head_type",
+            type=str,
+            default="linear",
+            choices=["linear", "mlp", "gated"],
+            help="Architecture of the future predictor head.",
+        )
+        self.parser.add_argument(
+            "--future_predictor.dropout",
+            type=float,
+            default=0.1,
+            help="Dropout used inside the future predictor head.",
+        )
+
         # action layer configs
         self.parser.add_argument(
             "--action_layer.enable",
