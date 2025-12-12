@@ -56,12 +56,15 @@ def _to_text(sample: Dict[str, Any]) -> str:
         parts.append(f"difficulty={sample['difficulty']}")
     if sample.get("source"):
         parts.append(f"source={sample['source']}")
-    if sample.get("problem"):
-        parts.append(f"Problem:\n{sample['problem']}")
-    if sample.get("solution"):
-        parts.append(f"Solution:\n{sample['solution']}")
-    if sample.get("answer"):
-        parts.append(f"Answer: {sample['answer']}")
+
+    # Only emit problem/solution for the training text (no answer).
+    problem = sample.get("problem")
+    solution = sample.get("solution")
+    if problem:
+        parts.append(f"Human: {problem}")
+    if solution:
+        parts.append(f"Assistant: {solution}")
+
     return "\n\n".join(parts)
 
 
