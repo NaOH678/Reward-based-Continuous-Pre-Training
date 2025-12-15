@@ -942,7 +942,19 @@ def main(job_config: JobConfig):
                                 logger.info(
                                     f"[flex_debug] step?_future pass varlen len={int(cu_seqlens.view(-1)[-1])} window={future_window_k}"
                                 )
-                            if cu_seqlens is not None and _HAS_FLEX_ATTENTION and _HAS_FLEX_INTERFACE:
+                            empty_cu = False
+                            cu_vec = None
+                            if cu_seqlens is not None:
+                                cu_vec = cu_seqlens[0] if cu_seqlens.dim() == 2 else cu_seqlens
+                                empty_cu = cu_vec.numel() == 0 or cu_vec[-1] == 0
+                            if empty_cu:
+                                future_valid = torch.zeros(
+                                    (hidden_states.size(0), hidden_states.size(1)),
+                                    dtype=torch.bool,
+                                    device=hidden_states.device,
+                                )
+                                future_summaries_detached = torch.zeros_like(hidden_states)
+                            elif cu_seqlens is not None and _HAS_FLEX_ATTENTION and _HAS_FLEX_INTERFACE:
                                 _register_future_flex_attn()
                                 prev_impl = getattr(model.config, "_attn_implementation", None)
                                 prev_window = getattr(model.config, "_future_window_k", None)
@@ -973,15 +985,6 @@ def main(job_config: JobConfig):
                                     model.model.config._attn_implementation = prev_impl
                                     model.model.config._future_window_k = prev_window
                                 # Build validity mask: length of allowed future tokens per position
-                                cu = cu_seqlens[0].to(input_ids.device)
-                                pos = torch.arange(cu[-1], device=input_ids.device, dtype=cu.dtype)
-                                seg_end = cu[torch.bucketize(pos, cu[1:]) + 1]
-                                future_len = seg_end - pos - 1
-                                if future_window_k not in (None, 0):
-                                    future_len = torch.minimum(
-                                    future_len, torch.tensor(future_window_k, device=input_ids.device, dtype=cu.dtype)
-                                )
-                                future_valid = (future_len > 0).unsqueeze(0)
                             elif cu_seqlens is not None:
                                 # Fallback dense future mask for varlen
                                 future_mask, future_valid = build_future_mask_from_cu(
@@ -990,21 +993,29 @@ def main(job_config: JobConfig):
                                     dtype=teacher_dtype,
                                     device=input_ids.device,
                                 )
-                                future_forward_kwargs = dict(
-                                    input_ids=input_ids,
-                                    position_ids=future_position_ids,
-                                    attention_mask=future_mask,
-                                    output_hidden_states=True,
-                                    use_cache=False,
-                                )
-                                if _FLEX_DEBUG:
-                                    logger.info(
-                                        f"[flex_debug] future dense forward window={future_window_k} mask_shape={tuple(future_mask.shape)} "
-                                        f"cu_seqlens_len={int(cu_seqlens.view(-1)[-1])}"
+                                if future_mask is None or future_valid is None:
+                                    future_valid = torch.zeros(
+                                        (hidden_states.size(0), hidden_states.size(1)),
+                                        dtype=torch.bool,
+                                        device=hidden_states.device,
                                     )
-                                with torch.no_grad():
-                                    future_output = model(**future_forward_kwargs)
-                                    future_summaries_detached = future_output.hidden_states[-1].detach()
+                                    future_summaries_detached = torch.zeros_like(hidden_states)
+                                else:
+                                    future_forward_kwargs = dict(
+                                        input_ids=input_ids,
+                                        position_ids=future_position_ids,
+                                        attention_mask=future_mask,
+                                        output_hidden_states=True,
+                                        use_cache=False,
+                                    )
+                                    if _FLEX_DEBUG:
+                                        logger.info(
+                                            f"[flex_debug] future dense forward window={future_window_k} mask_shape={tuple(future_mask.shape)} "
+                                            f"cu_seqlens_len={int(cu_seqlens.view(-1)[-1])}"
+                                        )
+                                    with torch.no_grad():
+                                        future_output = model(**future_forward_kwargs)
+                                        future_summaries_detached = future_output.hidden_states[-1].detach()
                             elif attention_mask is not None:
                                 # Non-varlen path: dense padding-aware future mask.
                                 future_attn_mask, future_valid = build_future_attention_mask(
