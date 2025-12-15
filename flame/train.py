@@ -96,7 +96,6 @@ _MODEL_CONVERTERS = None
 _BLOCK_MASK_CACHE: dict = {}
 _WARNED_NO_FLEX = False
 _FLEX_REG_DONE = False
-_HAS_FLEX_INTERFACE = False
 _FLEX_DEBUG = bool(int(os.environ.get("FLEX_DEBUG", "0")))
 
 
