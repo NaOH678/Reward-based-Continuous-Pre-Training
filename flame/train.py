@@ -20,6 +20,16 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from fla.modules.fused_linear_cross_entropy import FusedLinearCrossEntropyLoss
 from fla.ops.utils import prepare_position_ids
+try:
+    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+    _HAS_FLEX_ATTENTION = True
+except ImportError:  # pragma: no cover - flex_attention not available on older torch
+    _HAS_FLEX_ATTENTION = False
+try:
+    from transformers import AttentionInterface, AttentionMaskInterface
+    _HAS_FLEX_INTERFACE = True
+except Exception:  # pragma: no cover - older transformers
+    _HAS_FLEX_INTERFACE = False
 from torch.distributed.elastic.multiprocessing.errors import record
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.ft import FTParallelDims, init_ft_manager
@@ -83,6 +93,10 @@ def _log_sample_preview(dataset, tokenizer, color, max_chars: int = 400, max_tok
 
 _MODEL_CONVERTER_HOOK_MODEL_PARTS = None
 _MODEL_CONVERTERS = None
+_BLOCK_MASK_CACHE: dict = {}
+_WARNED_NO_FLEX = False
+_FLEX_REG_DONE = False
+_HAS_FLEX_INTERFACE = False
 
 
 def _optimizer_post_step_hook(*args, **kwargs):
@@ -149,6 +163,188 @@ def build_future_attention_mask(
     future_valid = (positions < max_valid_index.unsqueeze(1)) & attention_mask.bool()
 
     return future_mask, future_valid
+
+
+def _segment_ids_from_cu_seqlens(cu_seqlens: torch.Tensor) -> tuple[torch.Tensor, int]:
+    """
+    Derive segment ids for each token position from cu_seqlens.
+    Returns (segment_id, total_len).
+    """
+    if cu_seqlens.dim() == 2:
+        cu = cu_seqlens[0]
+    else:
+        cu = cu_seqlens
+    total_len = int(cu[-1].item())
+    positions = torch.arange(total_len, device=cu.device, dtype=cu.dtype)
+    segment_id = torch.bucketize(positions, cu[1:])
+    return segment_id, total_len
+
+
+def _make_future_mask_mod(segment_id: torch.Tensor, window_k: int | None):
+    """
+    Build a mask_mod for flex attention that keeps only same-segment future tokens within an optional window.
+    """
+
+    def mask_mod(_b, _h, q_idx, kv_idx):
+        same = segment_id[q_idx] == segment_id[kv_idx]
+        future = kv_idx > q_idx
+        if window_k is not None and window_k > 0:
+            future = future & (kv_idx - q_idx <= window_k)
+        return same & future
+
+    return mask_mod
+
+
+def _make_future_score_mod(segment_id: torch.Tensor, window_k: int | None, neg_inf: float):
+    """
+    Build a score_mod for flex attention that mirrors _make_future_mask_mod and applies -inf elsewhere.
+    """
+
+    def score_mod(score, _b, _h, q_idx, kv_idx):
+        same = segment_id[q_idx] == segment_id[kv_idx]
+        future = kv_idx > q_idx
+        if window_k is not None and window_k > 0:
+            future = future & (kv_idx - q_idx <= window_k)
+        return torch.where(same & future, score, torch.tensor(neg_inf, device=score.device, dtype=score.dtype))
+
+    return score_mod
+
+
+def _get_block_mask(mask_mod, S: int, device: torch.device, cache_key):
+    """
+    Cache block masks keyed by a hashable cache_key (e.g., cu_seqlens + window_k + length).
+    """
+    block_mask = _BLOCK_MASK_CACHE.get(cache_key)
+    if block_mask is None or block_mask.device != device:
+        block_mask = create_block_mask(mask_mod, 1, 1, S, S, device=device)
+        _BLOCK_MASK_CACHE[cache_key] = block_mask
+    return block_mask
+
+
+def flex_future_summaries(hidden_states: torch.Tensor, cu_seqlens: torch.Tensor, window_k: int | None):
+    """
+    Compute future summaries using flex attention with a doc + anti-causal (+ window) mask derived from cu_seqlens.
+    Returns future_summaries and future_valid mask (both detached).
+    """
+    if not _HAS_FLEX_ATTENTION:
+        raise RuntimeError("flex_attention is not available in this environment.")
+
+    with torch.no_grad():
+        segment_id, total_len = _segment_ids_from_cu_seqlens(cu_seqlens)
+        device = hidden_states.device
+        dtype = hidden_states.dtype
+        mask_mod = _make_future_mask_mod(segment_id, window_k)
+        score_mod = _make_future_score_mod(segment_id, window_k, torch.finfo(dtype).min)
+        cache_key = (total_len, window_k, tuple(cu_seqlens.view(-1).tolist()), device)
+        block_mask = _get_block_mask(mask_mod, total_len, device, cache_key)
+
+        q = hidden_states.unsqueeze(1)  # (B, 1, S, H)
+        k = q
+        v = q
+        attn_out = flex_attention(q, k, v, score_mod=score_mod, block_mask=block_mask)
+        summaries = attn_out.squeeze(1).to(dtype)
+
+        # validity: each position has at least one allowed future token
+        positions = torch.arange(total_len, device=device, dtype=cu_seqlens.dtype)
+        seg_end = cu_seqlens[0, segment_id + 1]
+        future_len = seg_end - positions - 1
+        if window_k is not None and window_k > 0:
+            future_len = torch.minimum(future_len, torch.tensor(window_k, device=device, dtype=future_len.dtype))
+        future_valid = (future_len > 0).unsqueeze(0)
+
+    return summaries.detach(), future_valid.detach()
+
+
+def build_future_mask_from_cu(
+    cu_seqlens: torch.Tensor, window_k: int | None, dtype: torch.dtype, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Build a dense additive mask (B=1) and future_valid from cu_seqlens for an anti-causal (+window) setting.
+    Mask shape: [1, 1, T, T], 0 for allowed, -inf otherwise. future_valid shape: [1, T].
+    """
+    segment_id, total_len = _segment_ids_from_cu_seqlens(cu_seqlens)
+    pos = torch.arange(total_len, device=device, dtype=cu_seqlens.dtype)
+    diff = pos[None, :] - pos[:, None]  # kv_idx - q_idx
+    same = segment_id[:, None] == segment_id[None, :]
+    future = diff > 0
+    if window_k is not None and window_k > 0:
+        future = future & (diff <= window_k)
+    allowed = same & future
+    neg_inf = -torch.finfo(dtype).max
+    mask = torch.full((total_len, total_len), fill_value=neg_inf, device=device, dtype=dtype)
+    mask = mask.masked_fill(allowed, 0.0).unsqueeze(0).unsqueeze(0)
+
+    seg_end = cu_seqlens[0, segment_id + 1]
+    future_len = seg_end - pos - 1
+    if window_k is not None and window_k > 0:
+        future_len = torch.minimum(future_len, torch.tensor(window_k, device=device, dtype=future_len.dtype))
+    future_valid = (future_len > 0).unsqueeze(0)
+    return mask, future_valid
+
+
+def _register_future_flex_attn():
+    """Register a flex attention implementation for future (anti-causal) masks."""
+    global _FLEX_REG_DONE
+    if _FLEX_REG_DONE or not (_HAS_FLEX_ATTENTION and _HAS_FLEX_INTERFACE):
+        return
+
+    def future_flex_attention_forward(module, query, key, value, attention_mask=None, **kwargs):
+        # attention_mask here is expected to be a BlockMask
+        out = flex_attention(query, key, value, block_mask=attention_mask)
+        return out, None
+
+    def future_flex_block_mask(
+        batch_size: int,
+        cache_position,
+        kv_length: int,
+        kv_offset: int = 0,
+        mask_function=None,
+        attention_mask=None,
+        cu_seqlens=None,
+        future_window_k=None,
+        **kwargs,
+    ):
+        if cu_seqlens is None:
+            raise ValueError("cu_seqlens is required to build future flex BlockMask.")
+        if cu_seqlens.dim() == 2:
+            cu = cu_seqlens[0]
+        else:
+            cu = cu_seqlens
+        device = cache_position.device
+        cu = cu.to(device)
+        total_len = int(cu[-1].item())
+        positions = torch.arange(total_len, device=device, dtype=cu.dtype)
+        segment_id = torch.bucketize(positions, cu[1:])
+        config = kwargs.get("config", None)
+        cfg_window = getattr(config, "_future_window_k", None) if config is not None else None
+        future_window = future_window_k if future_window_k not in (None, 0) else cfg_window
+
+        def mask_mod(_b, _h, q_idx, kv_idx):
+            same = segment_id[q_idx] == segment_id[kv_idx]
+            future = kv_idx > q_idx
+            if future_window is not None:
+                future = future & (kv_idx - q_idx <= future_window)
+            return same & future
+
+        H = config.num_attention_heads if config is not None else 1
+        B = batch_size
+        key = (
+            device,
+            B,
+            H,
+            total_len,
+            future_window,
+            tuple(cu.cpu().tolist()),
+        )
+        block_mask = _BLOCK_MASK_CACHE.get(key)
+        if block_mask is None or block_mask.device != device:
+            block_mask = create_block_mask(mask_mod, B, H, total_len, total_len, device=device)
+            _BLOCK_MASK_CACHE[key] = block_mask
+        return block_mask
+
+    AttentionInterface.register("future_flex", future_flex_attention_forward)
+    AttentionMaskInterface.register("future_flex", future_flex_block_mask)
+    _FLEX_REG_DONE = True
 
 def build_tokenizer(job_config: JobConfig) -> AutoTokenizer:
     return AutoTokenizer.from_pretrained(job_config.model.tokenizer_path)
@@ -790,36 +986,82 @@ def main(job_config: JobConfig):
                         future_summaries_detached = None
 
                         if job_config.future_encoder.enable:
+                            future_summaries_detached = None
+                            future_valid = None
                             hidden_states = output.hidden_states[-1]
-                            if attention_mask is not None:
-                                # Build anti-causal mask that still respects padding.
+                            teacher_dtype = hidden_states.dtype
+                            # Run a second forward (no grad) with anti-causal (+window) mask to get teacher summaries.
+                            future_window_k = job_config.future_encoder.future_k
+                            if cu_seqlens is not None and _HAS_FLEX_ATTENTION and _HAS_FLEX_INTERFACE:
+                                _register_future_flex_attn()
+                                prev_impl = getattr(model.config, "_attn_implementation", None)
+                                prev_window = getattr(model.config, "_future_window_k", None)
+                                model.config._attn_implementation = "future_flex"
+                                model.config._future_window_k = future_window_k if future_window_k != 0 else None
+                                future_forward_kwargs = dict(
+                                    input_ids=input_ids,
+                                    position_ids=position_ids,
+                                    cu_seqlens=cu_seqlens,
+                                    attention_mask=None,
+                                    output_hidden_states=True,
+                                    use_cache=False,
+                                )
+                                with torch.no_grad():
+                                    future_output = model(**future_forward_kwargs)
+                                    future_summaries_detached = future_output.hidden_states[-1].detach()
+                                model.config._attn_implementation = prev_impl
+                                model.config._future_window_k = prev_window
+                                # Build validity mask: length of allowed future tokens per position
+                                cu = cu_seqlens[0].to(input_ids.device)
+                                pos = torch.arange(cu[-1], device=input_ids.device, dtype=cu.dtype)
+                                seg_end = cu[torch.bucketize(pos, cu[1:]) + 1]
+                                future_len = seg_end - pos - 1
+                                if future_window_k not in (None, 0):
+                                    future_len = torch.minimum(
+                                        future_len, torch.tensor(future_window_k, device=input_ids.device, dtype=cu.dtype)
+                                    )
+                                future_valid = (future_len > 0).unsqueeze(0)
+                            elif cu_seqlens is not None:
+                                # Fallback dense future mask for varlen
+                                future_mask, future_valid = build_future_mask_from_cu(
+                                    cu_seqlens,
+                                    window_k=future_window_k if future_window_k != 0 else None,
+                                    dtype=teacher_dtype,
+                                    device=input_ids.device,
+                                )
+                                future_forward_kwargs = dict(
+                                    input_ids=input_ids,
+                                    position_ids=position_ids,
+                                    attention_mask=future_mask,
+                                    output_hidden_states=True,
+                                    use_cache=False,
+                                )
+                                with torch.no_grad():
+                                    future_output = model(**future_forward_kwargs)
+                                    future_summaries_detached = future_output.hidden_states[-1].detach()
+                            elif attention_mask is not None:
+                                # Non-varlen path: dense padding-aware future mask.
                                 future_attn_mask, future_valid = build_future_attention_mask(
-                                    attention_mask, dtype=hidden_states.dtype
+                                    attention_mask, dtype=labels.dtype
                                 )
                                 with torch.no_grad():
                                     future_output = model(
                                         input_ids=input_ids,
                                         position_ids=position_ids,
                                         attention_mask=future_attn_mask,
-                                        cu_seqlens=cu_seqlens,
                                         output_hidden_states=True,
                                         use_cache=False,
                                     )
-                                    future_summaries = future_output.hidden_states[-1].detach()
-                                    future_summaries_detached = future_summaries.detach()
-
-                                if mi_estimator is not None and future_predictor is not None:
-                                    predicted_future = future_predictor(hidden_states)
-                                    aux_loss = mi_estimator(
-                                        predicted_future, future_summaries, valid_mask=future_valid
-                                    )
-                                    aux_loss_scaled = (
-                                        aux_loss
-                                        * inv_grad_acc_steps
-                                        * job_config.future_encoder.loss_weight
-                                    )
-                            else:
-                                future_summaries_detached = None
+                                    future_summaries_detached = future_output.hidden_states[-1].detach()
+                            if future_valid is not None and future_predictor is not None and mi_estimator is not None:
+                                hidden_states = output.hidden_states[-1]
+                                predicted_future = future_predictor(hidden_states)
+                                aux_loss = mi_estimator(predicted_future, future_summaries_detached, valid_mask=future_valid)
+                                aux_loss_scaled = (
+                                    aux_loss
+                                    * inv_grad_acc_steps
+                                    * job_config.future_encoder.loss_weight
+                                )
                         total_loss = total_loss + aux_loss_scaled
 
                         if action_layer is not None:
