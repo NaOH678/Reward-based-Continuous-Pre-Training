@@ -97,6 +97,7 @@ _BLOCK_MASK_CACHE: dict = {}
 _WARNED_NO_FLEX = False
 _FLEX_REG_DONE = False
 _HAS_FLEX_INTERFACE = False
+_FLEX_DEBUG = bool(int(os.environ.get("FLEX_DEBUG", "0")))
 
 
 def _optimizer_post_step_hook(*args, **kwargs):
@@ -931,6 +932,10 @@ def main(job_config: JobConfig):
                                 future_position_ids = future_position_ids.unsqueeze(0)
                             # Run a second forward (no grad) with anti-causal (+window) mask to get teacher summaries.
                             future_window_k = job_config.future_encoder.future_k
+                            if _FLEX_DEBUG and cu_seqlens is not None and _HAS_FLEX_ATTENTION and _HAS_FLEX_INTERFACE:
+                                logger.info(
+                                    f"[flex_debug] step?_future pass varlen len={int(cu_seqlens.view(-1)[-1])} window={future_window_k}"
+                                )
                             if cu_seqlens is not None and _HAS_FLEX_ATTENTION and _HAS_FLEX_INTERFACE:
                                 _register_future_flex_attn()
                                 prev_impl = getattr(model.config, "_attn_implementation", None)
@@ -948,6 +953,11 @@ def main(job_config: JobConfig):
                                     output_hidden_states=True,
                                     use_cache=False,
                                 )
+                                if _FLEX_DEBUG:
+                                    logger.info(
+                                        f"[flex_debug] future flex forward using impl=future_flex window={model.config._future_window_k} "
+                                        f"cu_seqlens_len={int(cu_seqlens.view(-1)[-1])} pos_shape={tuple(future_position_ids.shape)}"
+                                    )
                                 with torch.no_grad():
                                     future_output = model(**future_forward_kwargs)
                                     future_summaries_detached = future_output.hidden_states[-1].detach()
@@ -981,6 +991,11 @@ def main(job_config: JobConfig):
                                     output_hidden_states=True,
                                     use_cache=False,
                                 )
+                                if _FLEX_DEBUG:
+                                    logger.info(
+                                        f"[flex_debug] future dense forward window={future_window_k} mask_shape={tuple(future_mask.shape)} "
+                                        f"cu_seqlens_len={int(cu_seqlens.view(-1)[-1])}"
+                                    )
                                 with torch.no_grad():
                                     future_output = model(**future_forward_kwargs)
                                     future_summaries_detached = future_output.hidden_states[-1].detach()
