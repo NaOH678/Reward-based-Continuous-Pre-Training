@@ -820,6 +820,13 @@ def main(job_config: JobConfig):
                     if "attention_mask" in batch
                     else None
                 )
+                if attention_mask is not None and attention_mask.dtype not in (
+                    torch.bool,
+                    torch.float16,
+                    torch.float32,
+                    torch.bfloat16,
+                ):
+                    attention_mask = attention_mask.to(dtype=torch.bool)
                 cu_seqlens = (
                     batch["cu_seqlens"].to(device_type)
                     if "cu_seqlens" in batch
@@ -833,6 +840,8 @@ def main(job_config: JobConfig):
                         .repeat(input_ids.shape[0], 1)
                         .to(torch.int32)
                     )
+                if position_ids.dim() == 1:
+                    position_ids = position_ids.unsqueeze(0)
                 # apply context parallelism if cp is enabled
                 # ensure CP handles the separate freqs_cis buffer for each pp stage
                 optional_context_parallel_ctx = (
@@ -915,6 +924,10 @@ def main(job_config: JobConfig):
                             future_valid = None
                             hidden_states = output.hidden_states[-1]
                             teacher_dtype = hidden_states.dtype
+                            # ensure position_ids are 2D for HF attention path
+                            future_position_ids = position_ids
+                            if future_position_ids is not None and future_position_ids.dim() == 1:
+                                future_position_ids = future_position_ids.unsqueeze(0)
                             # Run a second forward (no grad) with anti-causal (+window) mask to get teacher summaries.
                             future_window_k = job_config.future_encoder.future_k
                             if cu_seqlens is not None and _HAS_FLEX_ATTENTION and _HAS_FLEX_INTERFACE:
@@ -923,9 +936,12 @@ def main(job_config: JobConfig):
                                 prev_window = getattr(model.config, "_future_window_k", None)
                                 model.config._attn_implementation = "future_flex"
                                 model.config._future_window_k = future_window_k if future_window_k != 0 else None
+                                if hasattr(model, "model") and hasattr(model.model, "config"):
+                                    model.model.config._attn_implementation = model.config._attn_implementation
+                                    model.model.config._future_window_k = model.config._future_window_k
                                 future_forward_kwargs = dict(
                                     input_ids=input_ids,
-                                    position_ids=position_ids,
+                                    position_ids=future_position_ids,
                                     cu_seqlens=cu_seqlens,
                                     attention_mask=None,
                                     output_hidden_states=True,
@@ -936,6 +952,9 @@ def main(job_config: JobConfig):
                                     future_summaries_detached = future_output.hidden_states[-1].detach()
                                 model.config._attn_implementation = prev_impl
                                 model.config._future_window_k = prev_window
+                                if hasattr(model, "model") and hasattr(model.model, "config"):
+                                    model.model.config._attn_implementation = prev_impl
+                                    model.model.config._future_window_k = prev_window
                                 # Build validity mask: length of allowed future tokens per position
                                 cu = cu_seqlens[0].to(input_ids.device)
                                 pos = torch.arange(cu[-1], device=input_ids.device, dtype=cu.dtype)
@@ -943,8 +962,8 @@ def main(job_config: JobConfig):
                                 future_len = seg_end - pos - 1
                                 if future_window_k not in (None, 0):
                                     future_len = torch.minimum(
-                                        future_len, torch.tensor(future_window_k, device=input_ids.device, dtype=cu.dtype)
-                                    )
+                                    future_len, torch.tensor(future_window_k, device=input_ids.device, dtype=cu.dtype)
+                                )
                                 future_valid = (future_len > 0).unsqueeze(0)
                             elif cu_seqlens is not None:
                                 # Fallback dense future mask for varlen
@@ -956,7 +975,7 @@ def main(job_config: JobConfig):
                                 )
                                 future_forward_kwargs = dict(
                                     input_ids=input_ids,
-                                    position_ids=position_ids,
+                                    position_ids=future_position_ids,
                                     attention_mask=future_mask,
                                     output_hidden_states=True,
                                     use_cache=False,
