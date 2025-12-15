@@ -230,12 +230,14 @@ def _register_future_flex_attn():
         future_window_k=None,
         **kwargs,
     ):
+        # If caller already provided a BlockMask, just reuse it.
+        if attention_mask is not None and attention_mask.__class__.__name__ == "BlockMask":
+            return attention_mask
+        # Otherwise try to build from cu_seqlens if available.
         if cu_seqlens is None:
-            raise ValueError("cu_seqlens is required to build future flex BlockMask.")
-        if cu_seqlens.dim() == 2:
-            cu = cu_seqlens[0]
-        else:
-            cu = cu_seqlens
+            # Fallback to causal mask construction from attention_mask if nothing else is available.
+            return None
+        cu = cu_seqlens[0] if cu_seqlens.dim() == 2 else cu_seqlens
         device = cache_position.device
         cu = cu.to(device)
         total_len = int(cu[-1].item())
