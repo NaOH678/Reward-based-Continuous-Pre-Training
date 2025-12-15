@@ -216,6 +216,11 @@ def _register_future_flex_attn():
 
     def future_flex_attention_forward(module, query, key, value, attention_mask=None, **kwargs):
         # attention_mask here is expected to be a BlockMask
+        # Handle grouped-query attention: flex_attention expects the same head count for q and k/v.
+        if query.size(1) != key.size(1):
+            repeat_factor = query.size(1) // key.size(1)
+            key = key.repeat_interleave(repeat_factor, dim=1)
+            value = value.repeat_interleave(repeat_factor, dim=1)
         out = flex_attention(query, key, value, block_mask=attention_mask)
         return out, None
 
