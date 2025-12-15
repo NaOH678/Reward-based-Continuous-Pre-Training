@@ -176,7 +176,7 @@ def _segment_ids_from_cu_seqlens(cu_seqlens: torch.Tensor) -> tuple[torch.Tensor
         cu = cu_seqlens
     total_len = int(cu[-1].item())
     positions = torch.arange(total_len, device=cu.device, dtype=cu.dtype)
-    segment_id = torch.bucketize(positions, cu[1:])
+    segment_id = torch.bucketize(positions, cu[1:],right=True)
     return segment_id, total_len
 
 
@@ -216,7 +216,7 @@ def _future_valid_from_cu(cu_seqlens: torch.Tensor, window_k: int | None, device
     if cu.numel() == 0 or cu[-1] == 0:
         return None
     pos = torch.arange(cu[-1], device=device, dtype=cu.dtype)
-    seg_end = cu[torch.bucketize(pos, cu[1:]) + 1]
+    seg_end = cu[torch.bucketize(pos, cu[1:], right=True) + 1]
     future_len = seg_end - pos - 1
     if window_k not in (None, 0):
         future_len = torch.minimum(future_len, torch.tensor(window_k, device=device, dtype=cu.dtype))
@@ -264,7 +264,7 @@ def _register_future_flex_attn():
         cu = cu.to(device)
         total_len = int(cu[-1].item())
         positions = torch.arange(total_len, device=device, dtype=cu.dtype)
-        segment_id = torch.bucketize(positions, cu[1:])
+        segment_id = torch.bucketize(positions, cu[1:],right=True)
         config = kwargs.get("config", None)
         cfg_window = getattr(config, "_future_window_k", None) if config is not None else None
         future_window = future_window_k if future_window_k not in (None, 0) else cfg_window
