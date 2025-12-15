@@ -188,6 +188,8 @@ def build_future_mask_from_cu(
     Mask shape: [1, 1, T, T], 0 for allowed, -inf otherwise. future_valid shape: [1, T].
     """
     cu = cu_seqlens[0] if cu_seqlens.dim() == 2 else cu_seqlens
+    if cu.numel() == 0 or cu[-1] == 0:
+        return None, None
     segment_id, total_len = _segment_ids_from_cu_seqlens(cu)
     pos = torch.arange(total_len, device=device, dtype=cu.dtype)
     diff = pos[None, :] - pos[:, None]  # kv_idx - q_idx
@@ -206,6 +208,19 @@ def build_future_mask_from_cu(
         future_len = torch.minimum(future_len, torch.tensor(window_k, device=device, dtype=future_len.dtype))
     future_valid = (future_len > 0).unsqueeze(0)
     return mask, future_valid
+
+
+def _future_valid_from_cu(cu_seqlens: torch.Tensor, window_k: int | None, device: torch.device) -> torch.Tensor | None:
+    """Compute future_valid mask [1, T] from cu_seqlens with optional window; return None if empty."""
+    cu = cu_seqlens[0] if cu_seqlens.dim() == 2 else cu_seqlens
+    if cu.numel() == 0 or cu[-1] == 0:
+        return None
+    pos = torch.arange(cu[-1], device=device, dtype=cu.dtype)
+    seg_end = cu[torch.bucketize(pos, cu[1:]) + 1]
+    future_len = seg_end - pos - 1
+    if window_k not in (None, 0):
+        future_len = torch.minimum(future_len, torch.tensor(window_k, device=device, dtype=cu.dtype))
+    return (future_len > 0).unsqueeze(0)
 
 
 def _register_future_flex_attn():
@@ -243,6 +258,8 @@ def _register_future_flex_attn():
             # Fallback to causal mask construction from attention_mask if nothing else is available.
             return None
         cu = cu_seqlens[0] if cu_seqlens.dim() == 2 else cu_seqlens
+        if cu.numel() == 0 or cu[-1] == 0:
+            return None
         device = cache_position.device
         cu = cu.to(device)
         total_len = int(cu[-1].item())
@@ -942,19 +959,7 @@ def main(job_config: JobConfig):
                                 logger.info(
                                     f"[flex_debug] step?_future pass varlen len={int(cu_seqlens.view(-1)[-1])} window={future_window_k}"
                                 )
-                            empty_cu = False
-                            cu_vec = None
-                            if cu_seqlens is not None:
-                                cu_vec = cu_seqlens[0] if cu_seqlens.dim() == 2 else cu_seqlens
-                                empty_cu = cu_vec.numel() == 0 or cu_vec[-1] == 0
-                            if empty_cu:
-                                future_valid = torch.zeros(
-                                    (hidden_states.size(0), hidden_states.size(1)),
-                                    dtype=torch.bool,
-                                    device=hidden_states.device,
-                                )
-                                future_summaries_detached = torch.zeros_like(hidden_states)
-                            elif cu_seqlens is not None and _HAS_FLEX_ATTENTION and _HAS_FLEX_INTERFACE:
+                            if cu_seqlens is not None and _HAS_FLEX_ATTENTION and _HAS_FLEX_INTERFACE:
                                 _register_future_flex_attn()
                                 prev_impl = getattr(model.config, "_attn_implementation", None)
                                 prev_window = getattr(model.config, "_future_window_k", None)
@@ -985,6 +990,17 @@ def main(job_config: JobConfig):
                                     model.model.config._attn_implementation = prev_impl
                                     model.model.config._future_window_k = prev_window
                                 # Build validity mask: length of allowed future tokens per position
+                                future_valid = _future_valid_from_cu(
+                                    cu_seqlens,
+                                    window_k=future_window_k if future_window_k != 0 else None,
+                                    device=input_ids.device,
+                                )
+                                if future_valid is None:
+                                    future_valid = torch.zeros(
+                                        (hidden_states.size(0), hidden_states.size(1)),
+                                        dtype=torch.bool,
+                                        device=hidden_states.device,
+                                    )
                             elif cu_seqlens is not None:
                                 # Fallback dense future mask for varlen
                                 future_mask, future_valid = build_future_mask_from_cu(
