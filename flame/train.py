@@ -187,8 +187,9 @@ def build_future_mask_from_cu(
     Build a dense additive mask (B=1) and future_valid from cu_seqlens for an anti-causal (+window) setting.
     Mask shape: [1, 1, T, T], 0 for allowed, -inf otherwise. future_valid shape: [1, T].
     """
-    segment_id, total_len = _segment_ids_from_cu_seqlens(cu_seqlens)
-    pos = torch.arange(total_len, device=device, dtype=cu_seqlens.dtype)
+    cu = cu_seqlens[0] if cu_seqlens.dim() == 2 else cu_seqlens
+    segment_id, total_len = _segment_ids_from_cu_seqlens(cu)
+    pos = torch.arange(total_len, device=device, dtype=cu.dtype)
     diff = pos[None, :] - pos[:, None]  # kv_idx - q_idx
     same = segment_id[:, None] == segment_id[None, :]
     future = diff > 0
@@ -199,7 +200,7 @@ def build_future_mask_from_cu(
     mask = torch.full((total_len, total_len), fill_value=neg_inf, device=device, dtype=dtype)
     mask = mask.masked_fill(allowed, 0.0).unsqueeze(0).unsqueeze(0)
 
-    seg_end = cu_seqlens[0, segment_id + 1]
+    seg_end = cu[segment_id + 1]
     future_len = seg_end - pos - 1
     if window_k is not None and window_k > 0:
         future_len = torch.minimum(future_len, torch.tensor(window_k, device=device, dtype=future_len.dtype))
