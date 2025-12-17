@@ -37,7 +37,6 @@ from torchtitan.components.loss import build_cross_entropy_loss
 from torchtitan.components.lr_scheduler import build_lr_schedulers
 from torchtitan.components.metrics import build_device_memory_monitor, build_metrics_processor, ensure_pp_loss_visible
 from torchtitan.components.optimizer import build_optimizers
-from torchtitan.config_manager import TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.protocols.model_converter import build_model_converters
@@ -51,7 +50,7 @@ import custom_models
 from flame.components.checkpoint import TrainState
 from flame.config_manager import JobConfig
 from flame.data import build_dataloader, build_dataset
-from flame.models.parallelize_fla import apply_ddp, apply_fsdp, parallelize_fla
+from flame.models.parallelize_fla import parallelize_fla
 from flame.models.pipeline_fla import pipeline_fla
 from flame.models.mi_estimator import build_mi_estimator
 from flame.models.future_predictor import FuturePredictorHead
@@ -297,35 +296,6 @@ def _register_future_flex_attn():
     AttentionMaskInterface.register("future_flex", future_flex_block_mask)
     _FLEX_REG_DONE = True
 
-
-def _parallelize_aux_module(module, world_mesh, parallel_dims, job_config):
-    if parallel_dims.dp_shard_enabled or parallel_dims.cp_enabled:
-        if parallel_dims.dp_replicate_enabled:
-            dp_mesh_dim_names = ("dp_replicate", "dp_shard_cp")
-        else:
-            dp_mesh_dim_names = ("dp_shard_cp",)
-        apply_fsdp(
-            module,
-            world_mesh[tuple(dp_mesh_dim_names)],
-            param_dtype=TORCH_DTYPE_MAP[job_config.training.mixed_precision_param],
-            reduce_dtype=TORCH_DTYPE_MAP[job_config.training.mixed_precision_reduce],
-            pp_enabled=parallel_dims.pp_enabled,
-            cpu_offload=job_config.training.enable_cpu_offload,
-            reshard_after_forward_policy=job_config.training.fsdp_reshard_after_forward,
-        )
-        return True
-    if parallel_dims.dp_replicate_enabled:
-        if world_mesh.ndim > 1:
-            raise RuntimeError("DDP has not supported > 1D parallelism")
-        apply_ddp(
-            module,
-            world_mesh,
-            enable_compile=job_config.training.compile,
-            enable_compiled_autograd=job_config.experimental.enable_compiled_autograd,
-        )
-        return True
-    return False
-
 def build_tokenizer(job_config: JobConfig) -> AutoTokenizer:
     return AutoTokenizer.from_pretrained(job_config.model.tokenizer_path)
 
@@ -464,8 +434,6 @@ def main(job_config: JobConfig):
         num_workers=job_config.training.num_workers,
         seed=job_config.training.seed,
         trust_remote_code=job_config.training.trust_remote_code,
-        seq_len=job_config.training.seq_len,
-        eos_token_id=tokenizer.eos_token_id,
     )
     dataset_size = getattr(dataset, "_flame_num_rows", None)
     if job_config.training.epochs is not None:
@@ -623,9 +591,15 @@ def main(job_config: JobConfig):
             future_predictor.to(init_device)
             future_predictor.train()
             if len(list(future_predictor.parameters())) > 0:
-                _parallelize_aux_module(
-                    future_predictor, world_mesh, parallel_dims, job_config
-                )
+                if parallel_dims.dp_replicate_enabled:
+                    ddp_kwargs = (
+                        {"device_ids": [device.index], "output_device": device.index}
+                        if device.type == "cuda"
+                        else {}
+                    )
+                    future_predictor = DDP(
+                        future_predictor, broadcast_buffers=False, **ddp_kwargs
+                    )
                 model_parts.append(future_predictor)
 
         mi_estimator = build_mi_estimator(
@@ -636,7 +610,13 @@ def main(job_config: JobConfig):
         mi_estimator.to(init_device)
         mi_estimator.train()
         if len(list(mi_estimator.parameters())) > 0:
-            _parallelize_aux_module(mi_estimator, world_mesh, parallel_dims, job_config)
+            if parallel_dims.dp_replicate_enabled:
+                ddp_kwargs = (
+                    {"device_ids": [device.index], "output_device": device.index}
+                    if device.type == "cuda"
+                    else {}
+                )
+            mi_estimator = DDP(mi_estimator, broadcast_buffers=False, **ddp_kwargs)
             model_parts.append(mi_estimator)
 
     if job_config.action_layer.enable:
@@ -672,7 +652,13 @@ def main(job_config: JobConfig):
         action_layer.to(init_device)
         action_layer.train()
         if len(list(action_layer.parameters())) > 0:
-            _parallelize_aux_module(action_layer, world_mesh, parallel_dims, job_config)
+            if parallel_dims.dp_replicate_enabled:
+                ddp_kwargs = (
+                    {"device_ids": [device.index], "output_device": device.index}
+                    if device.type == "cuda"
+                    else {}
+                )
+                action_layer = DDP(action_layer, broadcast_buffers=False, **ddp_kwargs)
             model_parts.append(action_layer)
 
     device_mem_stats = device_memory_monitor.get_peak_stats()
