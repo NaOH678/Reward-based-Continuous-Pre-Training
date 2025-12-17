@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import bisect
 import copy
 import pickle
 from copy import deepcopy
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Union
 
 import datasets
@@ -14,6 +16,7 @@ import torch
 from datasets import Dataset, IterableDataset, interleave_datasets, load_dataset
 from datasets.iterable_dataset import ShufflingConfig
 from torch.distributed.checkpoint.stateful import Stateful
+from torch.utils.data import IterableDataset as TorchIterableDataset
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PreTrainedTokenizer
 
@@ -76,6 +79,207 @@ def _ensure_text_column(
         dataset = dataset.map(_conversation_to_text, **map_kwargs)
         return dataset.select_columns('text')
     raise ValueError("Dataset has no 'text', 'content', or 'conversations' column")
+
+
+_TOKEN_FILE_SUFFIXES = (".npy", ".bin")
+
+
+def _strip_file_scheme(path: str) -> str:
+    return path[7:] if path.startswith("file://") else path
+
+
+def _resolve_local_paths(dataset: str) -> Optional[List[Path]]:
+    parts = [p.strip() for p in dataset.split(",")]
+    if not parts or any(not p for p in parts):
+        return None
+    paths: List[Path] = []
+    for part in parts:
+        local = Path(_strip_file_scheme(part)).expanduser()
+        if not local.exists():
+            return None
+        paths.append(local)
+    return paths
+
+
+def _collect_token_files(paths: List[Path]) -> List[Path]:
+    token_files: List[Path] = []
+    for path in paths:
+        if path.is_dir():
+            for suffix in _TOKEN_FILE_SUFFIXES:
+                token_files.extend(sorted(path.rglob(f"*{suffix}")))
+        elif path.suffix in _TOKEN_FILE_SUFFIXES:
+            token_files.append(path)
+    return sorted(token_files, key=lambda p: str(p))
+
+
+class TokenMemmapIterableDataset(TorchIterableDataset):
+    """Iterate over fixed-length token chunks from raw binary or .npy token files."""
+    _flame_pretokenized = True
+
+    def __init__(
+        self,
+        paths: List[Path],
+        seq_len: int,
+        dtype: np.dtype = np.uint32,
+        eos_token_id: Optional[int] = None,
+        drop_last: bool = True,
+        seed: Optional[int] = None,
+    ) -> TokenMemmapIterableDataset:
+        if seq_len <= 0:
+            raise ValueError("seq_len must be positive for token memmap datasets")
+        if not paths:
+            raise ValueError("At least one token file is required")
+        self.paths = paths
+        self.seq_len = int(seq_len)
+        self.dtype = np.dtype(dtype)
+        self.eos_token_id = eos_token_id
+        self.drop_last = drop_last
+        self.seed = seed
+        self.rank = 0
+        self.world_size = 1
+        self._epoch = 0
+        self._next_idx: Optional[int] = None
+        self._mmap_cache: Dict[Path, np.ndarray] = {}
+        self._standard_npy: Dict[Path, bool] = {}
+        self._file_tokens: List[int] = []
+        self._file_chunks: List[int] = []
+        self._chunk_offsets: List[int] = []
+        self._total_chunks = 0
+        self._init_file_index()
+
+    def set_shard(self, rank: int, world_size: int) -> None:
+        self.rank = rank
+        self.world_size = world_size
+
+    def set_eos_token_id(self, eos_token_id: Optional[int]) -> None:
+        self.eos_token_id = eos_token_id
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = epoch
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "next_idx": self._next_idx,
+            "epoch": self._epoch,
+        }
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        self._next_idx = state_dict.get("next_idx")
+        self._epoch = state_dict.get("epoch", 0)
+
+    def __len__(self) -> int:
+        return self._total_chunks
+
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info else 0
+        num_workers = worker_info.num_workers if worker_info else 1
+        global_worker_count = max(1, self.world_size * num_workers)
+        global_worker_id = (self.rank * num_workers) + worker_id
+
+        start_idx = self._next_idx if self._next_idx is not None else global_worker_id
+        if start_idx < global_worker_id:
+            start_idx = global_worker_id
+        if (start_idx - global_worker_id) % global_worker_count != 0:
+            start_idx += (global_worker_id - start_idx) % global_worker_count
+
+        for global_idx in range(start_idx, self._total_chunks, global_worker_count):
+            file_idx, local_idx = self._locate_chunk(global_idx)
+            chunk = self._read_chunk(file_idx, local_idx)
+            if chunk is None:
+                continue
+            out: Dict[str, Any] = {"input_ids": chunk}
+            if self.eos_token_id is not None:
+                cu_seqlens = self._build_cu_seqlens(chunk)
+                out["cu_seqlens"] = cu_seqlens
+            self._next_idx = global_idx + global_worker_count
+            yield out
+
+    def _init_file_index(self) -> None:
+        kept_paths: List[Path] = []
+        standard_npy: Dict[Path, bool] = {}
+        mmap_cache: Dict[Path, np.ndarray] = {}
+        file_tokens: List[int] = []
+        file_chunks: List[int] = []
+        chunk_offsets: List[int] = []
+        total_chunks = 0
+
+        for path in self.paths:
+            is_npy = self._is_standard_npy(path)
+            if is_npy:
+                arr = np.load(path, mmap_mode="r")
+                if arr.ndim != 1:
+                    raise ValueError(f"Expected 1D token array in {path}")
+                if arr.dtype != self.dtype:
+                    raise ValueError(f"Expected dtype {self.dtype} in {path}, found {arr.dtype}")
+                num_tokens = int(arr.shape[0])
+            else:
+                file_size = path.stat().st_size
+                item_size = self.dtype.itemsize
+                if file_size % item_size != 0:
+                    raise ValueError(f"File size is not aligned to dtype in {path}")
+                num_tokens = file_size // item_size
+
+            if self.drop_last:
+                num_chunks = num_tokens // self.seq_len
+            else:
+                num_chunks = (num_tokens + self.seq_len - 1) // self.seq_len
+            if num_chunks == 0:
+                continue
+
+            kept_paths.append(path)
+            standard_npy[path] = is_npy
+            file_tokens.append(num_tokens)
+            file_chunks.append(num_chunks)
+            chunk_offsets.append(total_chunks)
+            total_chunks += num_chunks
+
+        self.paths = kept_paths
+        self._standard_npy = standard_npy
+        self._mmap_cache = mmap_cache
+        self._file_tokens = file_tokens
+        self._file_chunks = file_chunks
+        self._chunk_offsets = chunk_offsets
+        self._total_chunks = total_chunks
+
+    def _is_standard_npy(self, path: Path) -> bool:
+        with path.open("rb") as f:
+            magic = f.read(6)
+        return magic == b"\x93NUMPY"
+
+    def _locate_chunk(self, global_idx: int) -> tuple[int, int]:
+        file_idx = bisect.bisect_right(self._chunk_offsets, global_idx) - 1
+        if file_idx < 0 or file_idx >= len(self._chunk_offsets):
+            raise IndexError("Chunk index out of range")
+        local_idx = global_idx - self._chunk_offsets[file_idx]
+        return file_idx, local_idx
+
+    def _get_array(self, file_idx: int) -> np.ndarray:
+        path = self.paths[file_idx]
+        arr = self._mmap_cache.get(path)
+        if arr is not None:
+            return arr
+        num_tokens = self._file_tokens[file_idx]
+        arr = np.memmap(path, mode="r", dtype=self.dtype, shape=(num_tokens,))
+        self._mmap_cache[path] = arr
+        return arr
+
+    def _read_chunk(self, file_idx: int, local_idx: int) -> Optional[np.ndarray]:
+        arr = self._get_array(file_idx)
+        start = local_idx * self.seq_len
+        end = start + self.seq_len
+        if end > arr.shape[0]:
+            return None
+        return np.asarray(arr[start:end], dtype=np.int64)
+
+    def _build_cu_seqlens(self, chunk: np.ndarray) -> np.ndarray:
+        eos_positions = np.where(chunk == self.eos_token_id)[0]
+        if eos_positions.size == 0:
+            return np.array([0, len(chunk)], dtype=np.int32)
+        cu = np.concatenate([np.array([0], dtype=np.int32), eos_positions.astype(np.int32) + 1])
+        if cu[-1] != len(chunk):
+            cu = np.concatenate([cu, np.array([len(chunk)], dtype=np.int32)])
+        return cu
 
 
 class SampleLevelIterableDataset(IterableDataset):
@@ -655,8 +859,28 @@ def build_dataset(
     num_workers: int = 32,
     seed: Optional[int] = None,
     trust_remote_code: bool = False,
+    seq_len: Optional[int] = None,
+    memmap_dtype: Union[str, np.dtype] = np.uint32,
+    eos_token_id: Optional[int] = None,
 ) -> IterableDataset:
     color = utils.Color
+    local_paths = _resolve_local_paths(dataset)
+    if local_paths:
+        token_paths = _collect_token_files(local_paths)
+        if token_paths:
+            if seq_len is None:
+                raise ValueError("seq_len is required for pretokenized .npy/.bin datasets")
+            token_dataset = TokenMemmapIterableDataset(
+                paths=token_paths,
+                seq_len=seq_len,
+                dtype=np.dtype(memmap_dtype),
+                eos_token_id=eos_token_id,
+                drop_last=True,
+                seed=seed,
+            )
+            setattr(token_dataset, "_flame_num_rows", len(token_dataset))
+            return token_dataset
+
     min_num_shards = dp_degree * num_workers if dp_degree else None
     dataset_num_rows = None
     if len(dataset.split(',')) == 1:
@@ -846,7 +1070,14 @@ def build_dataloader(
     snapshot_every_n_steps: Optional[int] = 1,
     sample_level: bool = False,
 ):
-    if sample_level:
+    if getattr(dataset, "_flame_pretokenized", False):
+        if varlen and batch_size != 1:
+            raise ValueError("varlen=True requires batch_size=1 for pretokenized datasets")
+        if hasattr(dataset, "set_shard"):
+            dataset.set_shard(rank=rank, world_size=world_size)
+        if hasattr(dataset, "set_eos_token_id") and tokenizer.eos_token_id is not None:
+            dataset.set_eos_token_id(tokenizer.eos_token_id)
+    elif sample_level:
         dataset = SampleLevelIterableDataset(
             dataset=dataset, tokenizer=tokenizer, seq_len=seq_len, rank=rank, world_size=world_size
         )

@@ -10,6 +10,8 @@ avataRL
 lm-evaluation-harness
 check_future_mask.py
 flame_origin
+OLMo
+OLMo*
 # shell scripts
 *.sh
 

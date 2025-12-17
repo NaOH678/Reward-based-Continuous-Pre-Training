@@ -434,6 +434,8 @@ def main(job_config: JobConfig):
         num_workers=job_config.training.num_workers,
         seed=job_config.training.seed,
         trust_remote_code=job_config.training.trust_remote_code,
+        seq_len=job_config.training.seq_len,
+        eos_token_id=tokenizer.eos_token_id,
     )
     dataset_size = getattr(dataset, "_flame_num_rows", None)
     if job_config.training.epochs is not None:
