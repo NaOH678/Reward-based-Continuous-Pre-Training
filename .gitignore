@@ -12,6 +12,7 @@ check_future_mask.py
 flame_origin
 OLMo
 OLMo*
+dolmino-50B
 # shell scripts
 *.sh
 

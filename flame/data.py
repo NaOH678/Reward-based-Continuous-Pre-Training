@@ -700,9 +700,8 @@ class DataCollatorForLanguageModeling:
 
             # --- cu_seqlens calculation logic remains the same ---
             if 'cu_seqlens' in examples[0]:
-                batch['cu_seqlens'] = (
-                    torch.cat([example['cu_seqlens'] for example in examples], dim=0).unsqueeze(0).to(dtype=torch.int32)
-                )  # Ensure int32
+                cu = torch.cat([example['cu_seqlens'].reshape(-1) for example in examples], dim=0)
+                batch['cu_seqlens'] = cu.to(dtype=torch.int32)
             else:
                 # determine boundaries by bos/eos positions
                 # Check for bos_token_id first
@@ -779,8 +778,11 @@ class DataCollatorForLanguageModeling:
                 # --- context_len splitting logic remains the same ---
                 if self.context_len is not None:
                     # This logic splits sequences based on context_len *after* initial boundaries are found
-                    bos = batch['cu_seqlens'][:-1].tolist()
-                    eos = batch['cu_seqlens'][1:].tolist()
+                    cu = batch['cu_seqlens']
+                    if cu.dim() == 2:
+                        cu = cu[0]
+                    bos = cu[:-1].tolist()
+                    eos = cu[1:].tolist()
                     # Handle empty sequences between boundaries
                     split_boundaries = []
                     for i, j in zip(bos, eos):

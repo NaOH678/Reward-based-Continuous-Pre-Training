@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import shutil
 import sys
+import threading
 import urllib.request
 from pathlib import Path
 from typing import List, Optional
@@ -72,9 +74,19 @@ def url_to_dest(url: str, output_dir: Path, flat: bool) -> Path:
     return output_dir / rel
 
 
-def download_url(url: str, dest: Path, overwrite: bool, timeout: int) -> None:
+def download_url(
+    url: str,
+    dest: Path,
+    overwrite: bool,
+    timeout: int,
+    print_lock: Optional[threading.Lock] = None,
+) -> None:
     if dest.exists() and not overwrite:
-        print(f"skip: {dest}")
+        if print_lock:
+            with print_lock:
+                print(f"skip: {dest}")
+        else:
+            print(f"skip: {dest}")
         return
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = dest.with_suffix(dest.suffix + ".partial")
@@ -82,7 +94,11 @@ def download_url(url: str, dest: Path, overwrite: bool, timeout: int) -> None:
     with urllib.request.urlopen(req, timeout=timeout) as resp, tmp_path.open("wb") as f:
         shutil.copyfileobj(resp, f)
     tmp_path.replace(dest)
-    print(f"saved: {dest}")
+    if print_lock:
+        with print_lock:
+            print(f"saved: {dest}")
+    else:
+        print(f"saved: {dest}")
 
 
 def main() -> int:
@@ -116,6 +132,12 @@ def main() -> int:
         "--overwrite",
         action="store_true",
         help="Re-download files even if they already exist.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        help="Number of concurrent download workers.",
     )
     parser.add_argument(
         "--timeout",
@@ -152,15 +174,39 @@ def main() -> int:
             print(url)
         return 0
 
-    for url in urls:
-        dest = url_to_dest(url, args.output_dir, args.flat)
-        try:
-            download_url(url, dest, args.overwrite, args.timeout)
-        except Exception as exc:
-            if args.continue_on_error:
-                print(f"error: {url} -> {exc}", file=sys.stderr)
-                continue
-            raise
+    print_lock = threading.Lock()
+    if args.workers <= 1:
+        for url in urls:
+            dest = url_to_dest(url, args.output_dir, args.flat)
+            try:
+                download_url(url, dest, args.overwrite, args.timeout, print_lock)
+            except Exception as exc:
+                if args.continue_on_error:
+                    print(f"error: {url} -> {exc}", file=sys.stderr)
+                    continue
+                raise
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
+            future_map = {
+                executor.submit(
+                    download_url,
+                    url,
+                    url_to_dest(url, args.output_dir, args.flat),
+                    args.overwrite,
+                    args.timeout,
+                    print_lock,
+                ): url
+                for url in urls
+            }
+            for future in concurrent.futures.as_completed(future_map):
+                url = future_map[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    if args.continue_on_error:
+                        print(f"error: {url} -> {exc}", file=sys.stderr)
+                        continue
+                    raise
 
     return 0
 
