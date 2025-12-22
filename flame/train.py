@@ -27,7 +27,7 @@ except ImportError:  # pragma: no cover - flex_attention not available on older 
     _HAS_FLEX_ATTENTION = False
 try:
     from transformers import AttentionInterface, AttentionMaskInterface
-    _HAS_FLEX_INTERFACE = True
+    _HAS_FLEX_INTERFACE = False
 except Exception:  # pragma: no cover - older transformers
     _HAS_FLEX_INTERFACE = False
 from torch.distributed.elastic.multiprocessing.errors import record
@@ -126,7 +126,9 @@ def _ensure_cloudpickle_for_dist_objects():
 
 
 def build_future_attention_mask(
-    attention_mask: torch.Tensor, dtype: torch.dtype
+    attention_mask: torch.Tensor,
+    dtype: torch.dtype,
+    window_k: int | None = None
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Build a padding-aware anti-causal attention mask and a validity mask for InfoNCE.
@@ -134,34 +136,159 @@ def build_future_attention_mask(
     Args:
         attention_mask: (B, T) with 1 for valid tokens, 0 for padding.
         dtype: dtype to use for the additive mask.
+        window_k: Optional window size for future attention. If None, attend to all future tokens.
     Returns:
         future_attn_mask: (B, 1, T, T) additive mask, 0 where attending is allowed, large negative elsewhere.
         future_valid: (B, T) bool mask where at least one valid future token exists.
     """
     bsz, seqlen = attention_mask.shape
     device = attention_mask.device
-    # Use a finite negative to avoid inf/NaN under mixed precision.
-    neg_inf = torch.tensor(-1e4, device=device, dtype=dtype)
+    neg_inf = -1e4
 
-    # Future-only mask: allow attending to positions strictly greater than t.
-    future_only = torch.triu(
-        torch.ones((seqlen, seqlen), device=device, dtype=torch.bool), diagonal=1
-    )
-    future_mask = torch.full(
-        (1, 1, seqlen, seqlen), fill_value=neg_inf.item(), device=device, dtype=dtype
-    )
-    future_mask = future_mask.masked_fill(future_only.unsqueeze(0).unsqueeze(0), 0.0)
-    future_mask = future_mask.expand(bsz, -1, -1, -1).contiguous()
+    # Create position indices
+    positions = torch.arange(seqlen, device=device)
 
+    # Future-only mask: allow attending to positions strictly greater than t
+    # future_only[i, j] = True if j > i (anti-causal)
+    future_only = positions[None, :] > positions[:, None]  # [T, T]
+
+    # Apply window constraint if specified
+    if window_k is not None and window_k > 0:
+        # Also require j <= i + window_k
+        distance = positions[None, :] - positions[:, None]  # j - i
+        within_window = distance <= window_k
+        future_only = future_only & within_window
+
+    # Convert to additive mask
+    future_mask = torch.where(
+        future_only,
+        0.0,
+        neg_inf
+    ).to(dtype=dtype)  # [T, T]
+
+    # Expand to batch
+    future_mask = future_mask.unsqueeze(0).unsqueeze(0).expand(bsz, 1, seqlen, seqlen).contiguous()
+
+    # Apply padding mask
     if attention_mask is not None:
         pad_mask = (attention_mask == 0).to(dtype=dtype)
         future_mask = future_mask + pad_mask[:, None, None, :] * neg_inf
 
-    # Valid positions are non-pad tokens that have at least one future valid token.
-    token_lens = attention_mask.sum(dim=1)
-    max_valid_index = torch.clamp(token_lens - 1, min=0)  # last index with a future
-    positions = torch.arange(seqlen, device=device).unsqueeze(0)
-    future_valid = (positions < max_valid_index.unsqueeze(1)) & attention_mask.bool()
+    # Valid positions are non-pad tokens that have at least one future valid token
+    if window_k is not None and window_k > 0:
+        # With window constraint: check if there's a valid future token within window (vectorized)
+        positions_i = torch.arange(seqlen, device=device)[:, None]  # [T, 1]
+        positions_j = torch.arange(seqlen, device=device)[None, :]  # [1, T]
+
+        # Check if j is in range (i, i+window_k] for each i
+        in_future = positions_j > positions_i  # j > i
+        in_window = positions_j <= positions_i + window_k  # j <= i + window_k
+        in_range = in_future & in_window  # [T, T]
+
+        # For each position i in each batch, check if any j in range is valid
+        future_exists = torch.einsum('bt,st->bs', attention_mask.float(), in_range.float()) > 0  # [B, T]
+        future_valid = future_exists & attention_mask.bool()
+    else:
+        # No window constraint: valid if there's any future token
+        token_lens = attention_mask.sum(dim=1)
+        max_valid_index = torch.clamp(token_lens - 1, min=0)
+        positions_batch = torch.arange(seqlen, device=device).unsqueeze(0)
+        future_valid = (positions_batch < max_valid_index.unsqueeze(1)) & attention_mask.bool()
+
+    return future_mask, future_valid
+
+
+def build_future_mask_from_batch_cu(
+    cu_seqlens: torch.Tensor,
+    attention_mask: torch.Tensor,
+    window_k: int | None,
+    dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Build document-aware anti-causal attention mask from batch-level cu_seqlens.
+    Optimized version with vectorized operations.
+
+    Args:
+        cu_seqlens: (B, max_num_docs+1) with -1 padding for invalid entries.
+                    Each row contains document boundaries for one sample.
+        attention_mask: (B, T) with 1 for valid tokens, 0 for padding.
+        window_k: Optional window size for future attention. If None, attend to all future in same doc.
+        dtype: dtype to use for the additive mask.
+
+    Returns:
+        future_attn_mask: (B, 1, T, T) additive mask, 0 where attending is allowed, large negative elsewhere.
+        future_valid: (B, T) bool mask where at least one valid future token exists within same document.
+    """
+    bsz, seqlen = attention_mask.shape
+    device = attention_mask.device
+    neg_inf = -1e4
+
+    # Initialize future mask: block everything initially
+    future_mask = torch.full(
+        (bsz, 1, seqlen, seqlen),
+        fill_value=neg_inf,
+        device=device,
+        dtype=dtype
+    )
+
+    # Initialize future_valid: no valid future initially
+    future_valid = torch.zeros((bsz, seqlen), dtype=torch.bool, device=device)
+
+    # Process each sample in the batch
+    for b in range(bsz):
+        cu = cu_seqlens[b]
+        # Filter out padding (-1)
+        valid_cu = cu[cu >= 0]
+
+        if valid_cu.numel() < 2:
+            continue
+
+        # For each document in this sample
+        for doc_idx in range(len(valid_cu) - 1):
+            doc_start = int(valid_cu[doc_idx].item())
+            doc_end = int(valid_cu[doc_idx + 1].item())
+
+            if doc_start >= doc_end:
+                continue
+
+            doc_len = doc_end - doc_start
+
+            # Create anti-causal mask for this document (vectorized)
+            # Position i attends to position j where j > i within the document
+            i_idx = torch.arange(doc_len, device=device)[:, None]  # [doc_len, 1]
+            j_idx = torch.arange(doc_len, device=device)[None, :]  # [1, doc_len]
+
+            # Anti-causal: j > i
+            doc_mask = (j_idx > i_idx).to(dtype=dtype)  # [doc_len, doc_len]
+
+            # Apply window constraint if specified
+            if window_k is not None and window_k > 0:
+                distance = j_idx - i_idx
+                doc_mask = doc_mask * (distance <= window_k).to(dtype=dtype)
+
+            # Convert to additive mask: 0 where allowed, neg_inf where blocked
+            doc_mask = torch.where(doc_mask > 0, 0.0, neg_inf)
+
+            # Place into the full mask
+            future_mask[b, 0, doc_start:doc_end, doc_start:doc_end] = doc_mask
+
+            # Mark positions with valid future (vectorized)
+            if window_k is not None and window_k > 0:
+                # Position i has valid future if min(i + window_k, doc_end - 1) > i
+                positions = torch.arange(doc_start, doc_end, device=device)
+                future_end = torch.minimum(
+                    positions + window_k,
+                    torch.tensor(doc_end - 1, device=device, dtype=positions.dtype)
+                )
+                has_future = future_end > positions
+                future_valid[b, doc_start:doc_end] = has_future
+            else:
+                # All positions except the last have valid future
+                future_valid[b, doc_start:doc_end-1] = True
+
+    # Apply padding mask
+    pad_mask = (attention_mask == 0).to(dtype=dtype)
+    future_mask = future_mask + pad_mask[:, None, None, :] * neg_inf
 
     return future_mask, future_valid
 
@@ -495,6 +622,7 @@ def main(job_config: JobConfig):
         seq_len=job_config.training.seq_len,
         context_len=job_config.training.context_len,
         varlen=job_config.training.varlen,
+        respect_doc_boundaries=job_config.future_encoder.respect_doc_boundaries,
         num_workers=job_config.training.num_workers,
         pin_memory=job_config.training.pin_memory,
         persistent_workers=job_config.training.persistent_workers,
@@ -868,12 +996,16 @@ def main(job_config: JobConfig):
                     attention_mask = attention_mask.to(dtype=torch.bool)
                 cu_seqlens = (
                     batch["cu_seqlens"].to(device_type)
-                    if "cu_seqlens" in batch
+                    if "cu_seqlens" in batch and batch["cu_seqlens"] is not None
                     else None
                 )
-                if cu_seqlens is not None:
+                # Handle position_ids based on cu_seqlens format
+                if cu_seqlens is not None and cu_seqlens.dim() == 1:
+                    # Varlen mode: cu_seqlens is 1D, use prepare_position_ids
                     position_ids = prepare_position_ids(cu_seqlens).to(torch.int32)
                 else:
+                    # Non-varlen mode (batch-level cu_seqlens is 2D) or no cu_seqlens
+                    # Use standard sequential position_ids for each batch element
                     position_ids = (
                         torch.arange(0, input_ids.shape[1], device=device_type)
                         .repeat(input_ids.shape[0], 1)
@@ -1015,7 +1147,7 @@ def main(job_config: JobConfig):
                                         dtype=torch.bool,
                                         device=hidden_states.device,
                                     )
-                            elif cu_seqlens is not None:
+                            elif cu_seqlens is not None and cu_seqlens.dim() == 1:
                                 # Fallback dense future mask for varlen
                                 future_mask, future_valid = build_future_mask_from_cu(
                                     cu_seqlens,
@@ -1047,10 +1179,23 @@ def main(job_config: JobConfig):
                                         future_output = model(**future_forward_kwargs)
                                         future_summaries_detached = future_output.hidden_states[-1].detach()
                             elif attention_mask is not None:
-                                # Non-varlen path: dense padding-aware future mask.
-                                future_attn_mask, future_valid = build_future_attention_mask(
-                                    attention_mask, dtype=labels.dtype
-                                )
+                                # Non-varlen path: check if we should use document-aware mask
+                                respect_doc_boundaries = job_config.future_encoder.respect_doc_boundaries
+                                if respect_doc_boundaries and cu_seqlens is not None and cu_seqlens.dim() == 2:
+                                    # Use document-aware future mask based on EOS tokens
+                                    future_attn_mask, future_valid = build_future_mask_from_batch_cu(
+                                        cu_seqlens=cu_seqlens,
+                                        attention_mask=attention_mask,
+                                        window_k=future_window_k if future_window_k != 0 else None,
+                                        dtype=torch.float32
+                                    )
+                                else:
+                                    # Fallback: simple future mask without document boundaries
+                                    future_attn_mask, future_valid = build_future_attention_mask(
+                                        attention_mask=attention_mask,
+                                        dtype=torch.float32,
+                                        window_k=future_window_k if future_window_k != 0 else None
+                                    )
                                 with torch.no_grad():
                                     future_output = model(
                                         input_ids=input_ids,
@@ -1069,6 +1214,10 @@ def main(job_config: JobConfig):
                                     * inv_grad_acc_steps
                                     * job_config.future_encoder.loss_weight
                                 )
+                                if metric_logger.should_log(train_state.step) and dist.get_rank() == 0:
+                                    logger.info(f"raw_aux={aux_loss.item():.4f}, scaled={aux_loss_scaled.item():.4f}, "
+                                                f"valid_tokens={future_valid.sum().item() if future_valid is not None else 0}"
+                                                f'log(valid_count) * (1/grad_acc_steps) * loss_weight={math.log(future_valid.sum().item()) * inv_grad_acc_steps * job_config.future_encoder.loss_weight}')
                         total_loss = total_loss + aux_loss_scaled
 
                         if action_layer is not None:

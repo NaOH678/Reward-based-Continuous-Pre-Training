@@ -825,6 +825,14 @@ class JobConfig:
             default=0.1,
             help="Weight of the auxiliary Future Encoder loss.",
         )
+        self.parser.add_argument(
+            "--future_encoder.respect_doc_boundaries",
+            action="store_true",
+            default=False,
+            help="Whether to respect document boundaries in future attention mask. "
+                 "When enabled, uses batch-level cu_seqlens to prevent cross-document attention. "
+                 "Significantly slower (~37%%) but more accurate. Most pre-training disables this.",
+        )
 
         # future predictor configs
         self.parser.add_argument(

@@ -13,8 +13,11 @@ flame_origin
 OLMo
 OLMo*
 dolmino-50B
+omni-math 
 # shell scripts
 *.sh
+
+*.jpg
 
 # docs
 docs/_build
