@@ -59,6 +59,49 @@ from flame.models.action_layer import ActionLayer
 from flame.tools.utils import get_nparams_and_flops
 
 
+def init_rope_inv_freq(model, device):
+    """
+    手动初始化 RoPE 的 inv_freq buffer。
+
+    这是因为 HuggingFace 模型将 inv_freq 注册为 non-persistent buffer，
+    不会保存到 checkpoint 中。当从 DCP checkpoint 加载时，post_init()
+    在 to_empty() 后无法正确初始化 inv_freq，导致 RoPE 失效。
+
+    Args:
+        model: HuggingFace 模型 (LlamaForCausalLM, OLMoForCausalLM, etc.)
+        device: 目标设备
+    """
+    config = model.config
+
+    # 获取 RoPE 参数
+    rope_theta = getattr(config, 'rope_theta', 10000.0)
+    head_dim = config.hidden_size // config.num_attention_heads
+
+    # 计算 inv_freq: 1 / (theta ^ (2i / dim))
+    inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+    inv_freq = inv_freq.to(device)
+
+    # 找到并设置所有 rotary_emb.inv_freq buffers
+    initialized = False
+    for name, module in model.named_modules():
+        if hasattr(module, 'inv_freq') and 'rotary' in name.lower():
+            if module.inv_freq.shape == inv_freq.shape:
+                module.inv_freq.copy_(inv_freq)
+                initialized = True
+
+    # 也处理顶层 rotary_emb (如 model.model.rotary_emb)
+    if hasattr(model, 'model') and hasattr(model.model, 'rotary_emb'):
+        rotary_emb = model.model.rotary_emb
+        if hasattr(rotary_emb, 'inv_freq') and rotary_emb.inv_freq.shape == inv_freq.shape:
+            rotary_emb.inv_freq.copy_(inv_freq)
+            initialized = True
+
+    if initialized:
+        logger.info(f"Initialized RoPE inv_freq: rope_theta={rope_theta}, head_dim={head_dim}")
+    else:
+        logger.warning("Could not find inv_freq buffer to initialize - model may not use RoPE")
+
+
 def _peek_raw_sample(dataset):
     """Return a single raw sample without assuming map or iterable semantics."""
     if isinstance(dataset, IterableDataset):
@@ -722,6 +765,9 @@ def main(job_config: JobConfig):
             m.to_empty(device=init_device)
             with torch.no_grad():
                 m.post_init()
+                # 关键修复：手动初始化 RoPE inv_freq buffer
+                # HF 模型将 inv_freq 注册为 non-persistent buffer，不会保存到 checkpoint
+                init_rope_inv_freq(m, init_device)
             m.train()
 
         # confirm that user will be able to view loss metrics on the console
@@ -732,6 +778,9 @@ def main(job_config: JobConfig):
         model.to_empty(device=init_device)
         with torch.no_grad():
             model.post_init()
+            # 关键修复：手动初始化 RoPE inv_freq buffer
+            # HF 模型将 inv_freq 注册为 non-persistent buffer，不会保存到 checkpoint
+            init_rope_inv_freq(model, init_device)
         model.train()
 
         model_parts = [model]
