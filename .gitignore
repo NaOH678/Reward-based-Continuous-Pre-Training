@@ -16,7 +16,7 @@ dolmino-50B
 omni-math 
 # shell scripts
 *.sh
-
+*.pdf
 *.jpg
 
 # docs

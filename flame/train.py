@@ -1256,17 +1256,32 @@ def main(job_config: JobConfig):
                                     future_summaries_detached = future_output.hidden_states[-1].detach()
                             if future_valid is not None and future_predictor is not None and mi_estimator is not None:
                                 hidden_states = output.hidden_states[-1]
-                                predicted_future = future_predictor(hidden_states)
-                                aux_loss = mi_estimator(predicted_future, future_summaries_detached, valid_mask=future_valid)
-                                aux_loss_scaled = (
-                                    aux_loss
-                                    * inv_grad_acc_steps
-                                    * job_config.future_encoder.loss_weight
-                                )
+                                # Align targets to future positions (t -> t+1) to avoid using the current token's residual.
+                                shift = 1
+                                if hidden_states.size(1) > shift:
+                                    predicted_future = future_predictor(hidden_states[:, :-shift, :])
+                                    future_target = future_summaries_detached[:, shift:, :]
+                                    future_valid_shifted = future_valid[:, :-shift] if future_valid is not None else None
+                                    aux_loss = mi_estimator(
+                                        predicted_future,
+                                        future_target,
+                                        valid_mask=future_valid_shifted,
+                                    )
+                                    aux_loss_scaled = (
+                                        aux_loss
+                                        * inv_grad_acc_steps
+                                        * job_config.future_encoder.loss_weight
+                                    )
+                                else:
+                                    aux_loss = torch.tensor(0.0, device=device)
+                                    aux_loss_scaled = torch.tensor(0.0, device=device)
                                 if metric_logger.should_log(train_state.step) and dist.get_rank() == 0:
-                                    logger.info(f"raw_aux={aux_loss.item():.4f}, scaled={aux_loss_scaled.item():.4f}, "
-                                                f"valid_tokens={future_valid.sum().item() if future_valid is not None else 0}"
-                                                f'log(valid_count) * (1/grad_acc_steps) * loss_weight={math.log(future_valid.sum().item()) * inv_grad_acc_steps * job_config.future_encoder.loss_weight}')
+                                    valid_tokens = future_valid.sum().item() if future_valid is not None else 0
+                                    logger.info(
+                                        f"raw_aux={aux_loss.item():.4f}, scaled={aux_loss_scaled.item():.4f}, "
+                                        f"valid_tokens={valid_tokens}"
+                                        f' log(valid_count) * (1/grad_acc_steps) * loss_weight={math.log(valid_tokens) * inv_grad_acc_steps * job_config.future_encoder.loss_weight if valid_tokens > 0 else 0.0}'
+                                    )
                         total_loss = total_loss + aux_loss_scaled
 
                         if action_layer is not None:
