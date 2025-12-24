@@ -1256,8 +1256,13 @@ def main(job_config: JobConfig):
                                     future_summaries_detached = future_output.hidden_states[-1].detach()
                             if future_valid is not None and future_predictor is not None and mi_estimator is not None:
                                 hidden_states = output.hidden_states[-1]
-                                # Align targets to future positions (t -> t+1) to avoid using the current token's residual.
-                                shift = 1
+                                # Align targets to future positions (t -> t+k) to avoid using the current token's residual.
+                                shift_k = max(1, getattr(job_config.future_encoder, "shift_k", 1))
+                                if shift_k > 1:
+                                    # Sample a random shift in [1, shift_k] each step to increase difficulty/diversity.
+                                    shift = int(torch.randint(1, shift_k + 1, (1,), device=hidden_states.device).item())
+                                else:
+                                    shift = 1
                                 if hidden_states.size(1) > shift:
                                     predicted_future = future_predictor(hidden_states[:, :-shift, :])
                                     future_target = future_summaries_detached[:, shift:, :]

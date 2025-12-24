@@ -800,6 +800,12 @@ class JobConfig:
             help="Horizon for future summary. If -1, use all remaining tokens.",
         )
         self.parser.add_argument(
+            "--future_encoder.shift_k",
+            type=int,
+            default=1,
+            help="Positive horizon shift for MI targets. If >1, a random shift in [1, shift_k] is sampled each step.",
+        )
+        self.parser.add_argument(
             "--future_encoder.summary_method",
             type=str,
             default="mean",
