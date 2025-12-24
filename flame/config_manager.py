@@ -860,6 +860,12 @@ class JobConfig:
             default=0.1,
             help="Dropout used inside the future predictor head.",
         )
+        self.parser.add_argument(
+            "--future_predictor.lr_scale",
+            type=float,
+            default=1.0,
+            help="Learning rate scale applied only to the future predictor optimizer/group.",
+        )
 
         # action layer configs
         self.parser.add_argument(

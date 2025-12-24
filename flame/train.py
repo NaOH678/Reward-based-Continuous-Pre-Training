@@ -872,6 +872,23 @@ def main(job_config: JobConfig):
         else model_parts
     )
     optimizers = train_spec.build_optimizers_fn(optim_model_parts, job_config, ft_manager)
+
+    # Optionally scale LR for the future predictor only.
+    fp_lr_scale = getattr(job_config.future_predictor, "lr_scale", 1.0)
+    if (
+        future_predictor is not None
+        and fp_lr_scale != 1.0
+        and hasattr(optimizers, "optimizers")
+    ):
+        try:
+            fp_idx = model_parts.index(future_predictor)
+            fp_optim = optimizers.optimizers[fp_idx]
+            for pg in fp_optim.param_groups:
+                pg["lr"] = pg["lr"] * fp_lr_scale
+            logger.info(f"Applied lr_scale={fp_lr_scale} to future_predictor optimizer")
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            logger.warning(f"Failed to apply lr_scale to future_predictor: {exc}")
+
     lr_schedulers = train_spec.build_lr_schedulers_fn(optimizers, job_config)
     # Post optimizer step model converters hook.
     # e.g. calculate float8 dynamic amax/scale for all-parameter for FSDP2
