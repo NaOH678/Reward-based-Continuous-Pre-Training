@@ -33,12 +33,14 @@ class FuturePredictorHead(nn.Module):
         if head_type == "linear":
             self.proj = nn.Linear(hidden_size, hidden_size)
         elif head_type == "mlp":
-            self.ffn = nn.Sequential(
-                nn.Linear(hidden_size, hidden_size),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_size, hidden_size),
-            )
+            mid = hidden_size * 2
+            self.gate_proj = nn.Linear(hidden_size, mid, bias=False)
+            self.up_proj = nn.Linear(hidden_size, mid, bias=False)
+            self.down_proj = nn.Linear(mid, hidden_size, bias=False)
+            # Initialize down_proj with smaller std to reduce early-time perturbation.
+            c = 0.03
+            down_std = c / (mid ** 0.5)
+            nn.init.normal_(self.down_proj.weight, mean=0.0, std=down_std)
         elif head_type == "gated":
             self.gate = nn.Linear(hidden_size, hidden_size)
             self.ffn = nn.Sequential(
@@ -63,7 +65,8 @@ class FuturePredictorHead(nn.Module):
         if self.head_type == "linear":
             h = self.proj(x_norm)
         elif self.head_type == "mlp":
-            h = self.ffn(x_norm)
+            h = torch.nn.functional.silu(self.gate_proj(x_norm)) * self.up_proj(x_norm)
+            h = self.down_proj(h)
         else:  # gated
             gate = torch.sigmoid(self.gate(x_norm))
             h = x + gate * self.ffn(x_norm)

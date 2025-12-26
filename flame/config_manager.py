@@ -866,6 +866,12 @@ class JobConfig:
             default=1.0,
             help="Learning rate scale applied only to the future predictor optimizer/group.",
         )
+        self.parser.add_argument(
+            "--future_predictor.weight_decay",
+            type=float,
+            default=0.0,
+            help="Override weight decay for future predictor only. If None, use optimizer.weight_decay.",
+        )
 
         # action layer configs
         self.parser.add_argument(

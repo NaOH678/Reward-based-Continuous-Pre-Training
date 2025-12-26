@@ -19,6 +19,7 @@ omni-math
 *.pdf
 *.jpg
 
+result_all*
 # docs
 docs/_build
 
