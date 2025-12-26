@@ -1481,6 +1481,15 @@ def main(job_config: JobConfig):
                     "optimizer/grad_norm": grad_norm.item(),
                     "optimizer/skipped_step": train_state.skipped_step,
                 }
+                # Log future predictor lr if available (to reflect lr_scale / warmup overrides).
+                if future_predictor is not None and hasattr(optimizers, "optimizers"):
+                    try:
+                        fp_idx = model_parts.index(future_predictor)
+                        fp_optim = optimizers.optimizers[fp_idx]
+                        fp_lr = fp_optim.param_groups[0]["lr"]
+                        extra_metrics["optimizer/lr_future_pred"] = fp_lr
+                    except Exception:
+                        pass
 
                 if job_config.future_encoder.enable:
                     extra_metrics["aux_loss"] = global_avg_aux_loss
