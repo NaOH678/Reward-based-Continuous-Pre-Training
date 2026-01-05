@@ -1177,8 +1177,8 @@ def main(job_config: JobConfig):
                             logits = output.logits
                             target_prob_mean = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
                             if dft_enabled:
-                                shift_logits = logits[..., :-1, :].contiguous()
-                                shift_labels = labels[..., 1:].contiguous()
+                                shift_logits = logits[:, :-1, :].contiguous()
+                                shift_labels = labels[:, 1:].contiguous()
                                 vocab_size = shift_logits.size(-1)
                                 shift_logits_flat = shift_logits.view(-1, vocab_size)
                                 shift_labels_flat = shift_labels.view(-1)
