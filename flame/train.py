@@ -1195,7 +1195,7 @@ def main(job_config: JobConfig):
                                     )
                                     probs = torch.softmax(selected_logits, dim=-1)
                                     target_probs = probs.gather(1, selected_labels.unsqueeze(-1)).squeeze(-1).detach()
-                                    target_prob_mean = target_probs.mean()
+                                    # target_prob_mean = target_probs.mean()
                                     dft_tokens = ce_tokens * target_probs
                                     dft_mean = dft_tokens.mean()
                                     ce_unweighted_mean = ce_tokens.mean()
