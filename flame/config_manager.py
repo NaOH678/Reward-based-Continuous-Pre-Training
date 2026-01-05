@@ -787,6 +787,19 @@ class JobConfig:
             """,
         )
 
+        # dft configs
+        self.parser.add_argument(
+            "--dft.enable",
+            action="store_true",
+            help="Enable DFT weighted CE loss (probability-weighted negative log-likelihood).",
+        )
+        self.parser.add_argument(
+            "--dft.mix_ce_ratio",
+            type=float,
+            default=0.0,
+            help="Optional mixture with standard CE: loss = mix * CE + (1-mix) * DFT. 0 to use pure DFT.",
+        )
+
         # future encoder configs
         self.parser.add_argument(
             "--future_encoder.enable",
@@ -871,6 +884,12 @@ class JobConfig:
             type=float,
             default=0.0,
             help="Override weight decay for future predictor only. If None, use optimizer.weight_decay.",
+        )
+        self.parser.add_argument(
+            "--future_predictor.warmup_steps",
+            type=int,
+            default=0,
+            help="Linear warmup steps applied only to future predictor lr (on top of lr_scale). 0 to disable.",
         )
 
         # action layer configs

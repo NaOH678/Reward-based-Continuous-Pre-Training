@@ -17,6 +17,7 @@ from datasets import IterableDataset
 import fla  # noqa
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from fla.modules.fused_linear_cross_entropy import FusedLinearCrossEntropyLoss
 from fla.ops.utils import prepare_position_ids
@@ -532,6 +533,19 @@ def main(job_config: JobConfig):
             f"{color.green}{json.dumps(job_config.to_dict(), indent=2, sort_keys=True)}{color.reset}"
         )
 
+    # Enable DFT loss mode and disable auxiliary future/action modules when requested.
+    dft_enabled = bool(getattr(job_config, "dft", None) and job_config.dft.enable)
+    if dft_enabled:
+        if getattr(job_config.future_encoder, "enable", False):
+            logger.info("DFT enabled: disabling future_encoder (MI teacher forward).")
+            job_config.future_encoder.enable = False
+        if getattr(job_config.future_predictor, "enable", False):
+            logger.info("DFT enabled: disabling future_predictor head.")
+            job_config.future_predictor.enable = False
+        if getattr(job_config.action_layer, "enable", False):
+            logger.info("DFT enabled: disabling action_layer.")
+            job_config.action_layer.enable = False
+
     # take control of garbage collection to avoid stragglers
     gc_handler = utils.GarbageCollection(gc_freq=job_config.training.gc_freq)
 
@@ -699,6 +713,9 @@ def main(job_config: JobConfig):
                 f"{color.reset}"
             )
             model_config.fuse_linear_cross_entropy = False
+    if dft_enabled and getattr(model_config, "fuse_linear_cross_entropy", False):
+        logger.info("DFT enabled: disabling fused linear cross entropy kernel.")
+        model_config.fuse_linear_cross_entropy = False
     model_config.vocab_size = max(tokenizer.vocab_size, model_config.vocab_size)
 
     logger.info(
@@ -876,6 +893,7 @@ def main(job_config: JobConfig):
     # Optionally scale LR / override weight decay for the future predictor only.
     fp_lr_scale = getattr(job_config.future_predictor, "lr_scale", 1.0)
     fp_wd_override = getattr(job_config.future_predictor, "weight_decay", None)
+    fp_idx = None
     if future_predictor is not None and hasattr(optimizers, "optimizers"):
         try:
             fp_idx = model_parts.index(future_predictor)
@@ -1000,6 +1018,7 @@ def main(job_config: JobConfig):
     logger.info(
         f"{color.green}  Number of parameters = {model_param_count:,} {color.reset}"
     )
+    dft_mix_ce_ratio = getattr(job_config.dft, "mix_ce_ratio", 0.0) if dft_enabled else 0.0
 
     with (
         maybe_enable_profiling(
@@ -1015,9 +1034,28 @@ def main(job_config: JobConfig):
 
             optimizers.zero_grad()
 
+            # Apply future predictor warmup scaling (on top of lr_scale).
+            fp_warmup_steps = getattr(job_config.future_predictor, "warmup_steps", 0)
+            fp_warmup_factor = 1.0
+            if (
+                fp_idx is not None
+                and fp_warmup_steps > 0
+                and hasattr(optimizers, "optimizers")
+            ):
+                fp_warmup_factor = min(1.0, train_state.step / fp_warmup_steps)
+                try:
+                    fp_optim = optimizers.optimizers[fp_idx]
+                    for pg in fp_optim.param_groups:
+                        base_lr = pg.get("fp_base_lr", pg["lr"])
+                        pg["lr"] = base_lr * fp_warmup_factor
+                except Exception as exc:  # pragma: no cover - defensive fallback
+                    logger.warning(f"Failed to apply future predictor warmup lr: {exc}")
+
             inv_grad_acc_steps = 1.0 / job_config.training.gradient_accumulation_steps
             losses = []
             ce_losses = []
+            ce_unweighted_losses = []
+            target_prob_means = []
             aux_losses = []
             action_losses = []
             action_metrics_acc = {}
@@ -1132,17 +1170,56 @@ def main(job_config: JobConfig):
                             output_hidden_states=job_config.future_encoder.enable,
                             use_cache=False,
                         )
-                        if not freeze_lm_for_infonce:
+                        if not freeze_lm_for_infonce and not dft_enabled:
                             forward_kwargs["labels"] = labels
                         with lm_forward_ctx, maybe_enable_amp:
                             output = model(**forward_kwargs)
-                            if freeze_lm_for_infonce:
-                                ce_loss_raw = torch.tensor(
-                                    0.0, device=device, dtype=output.logits.dtype
+                            logits = output.logits
+                            target_prob_mean = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+                            if dft_enabled:
+                                shift_logits = logits[..., :-1, :].contiguous()
+                                shift_labels = labels[..., 1:].contiguous()
+                                vocab_size = shift_logits.size(-1)
+                                shift_logits_flat = shift_logits.view(-1, vocab_size)
+                                shift_labels_flat = shift_labels.view(-1)
+                                valid_mask = shift_labels_flat != -100
+                                if attention_mask is not None:
+                                    valid_mask = valid_mask & attention_mask[:, 1:].reshape(-1).to(torch.bool)
+                                if valid_mask.any():
+                                    selected_logits = shift_logits_flat[valid_mask]
+                                    selected_labels = shift_labels_flat[valid_mask]
+                                    ce_tokens = F.cross_entropy(
+                                        selected_logits,
+                                        selected_labels,
+                                        reduction="none",
+                                    )
+                                    probs = torch.softmax(selected_logits, dim=-1)
+                                    target_probs = probs.gather(1, selected_labels.unsqueeze(-1)).squeeze(-1).detach()
+                                    target_prob_mean = target_probs.mean()
+                                    dft_tokens = ce_tokens * target_probs
+                                    dft_mean = dft_tokens.mean()
+                                    ce_unweighted_mean = ce_tokens.mean()
+                                else:
+                                    zero = shift_logits_flat.new_zeros(())
+                                    dft_mean = zero
+                                    ce_unweighted_mean = zero
+                                    target_prob_mean = zero
+                                ce_loss_raw = (
+                                    dft_mean
+                                    if dft_mix_ce_ratio <= 0.0
+                                    else dft_mix_ce_ratio * ce_unweighted_mean + (1.0 - dft_mix_ce_ratio) * dft_mean
                                 )
                             else:
-                                ce_loss_raw = output.loss
+                                if freeze_lm_for_infonce:
+                                    ce_loss_raw = torch.tensor(
+                                        0.0, device=device, dtype=output.logits.dtype
+                                    )
+                                    ce_unweighted_mean = ce_loss_raw
+                                else:
+                                    ce_loss_raw = output.loss
+                                    ce_unweighted_mean = ce_loss_raw
                             ce_loss = ce_loss_raw * inv_grad_acc_steps
+                            ce_unweighted_scaled = ce_unweighted_mean * inv_grad_acc_steps
                         # If action layer is enabled and ce_loss_weight is set (default 0), scale CE accordingly
                         ce_loss_weight = (
                             job_config.action_layer.ce_loss_weight
@@ -1333,6 +1410,9 @@ def main(job_config: JobConfig):
 
                 losses.append(total_loss)
                 ce_losses.append(ce_loss.detach())
+                ce_unweighted_losses.append(ce_unweighted_scaled.detach())
+                if dft_enabled:
+                    target_prob_means.append(target_prob_mean.detach())
                 aux_losses.append(aux_loss_scaled.detach())
                 action_losses.append(action_loss_scaled.detach())
                 if action_metrics_step is not None:
@@ -1344,8 +1424,14 @@ def main(job_config: JobConfig):
 
             loss = sum(losses)
             ce_loss_total = sum(ce_losses)
+            ce_unweighted_total = sum(ce_unweighted_losses)
             aux_loss_total = sum(aux_losses)
             action_loss_total = sum(action_losses)
+            target_prob_avg = (
+                sum(target_prob_means) / len(target_prob_means)
+                if target_prob_means
+                else torch.tensor(0.0, device=device)
+            )
             if action_metrics_count > 0:
                 action_metrics_avg = {
                     k: v / action_metrics_count for k, v in action_metrics_acc.items()
@@ -1379,6 +1465,14 @@ def main(job_config: JobConfig):
             else:
                 optimizers.step()
             lr_schedulers.step()
+            # Store base lr for fp after scheduler step so next iteration warmup scales from scheduler value.
+            if fp_idx is not None and hasattr(optimizers, "optimizers"):
+                try:
+                    fp_optim = optimizers.optimizers[fp_idx]
+                    for pg in fp_optim.param_groups:
+                        pg["fp_base_lr"] = pg["lr"]
+                except Exception:
+                    pass
 
             # log metrics - Use MetricsProcessor
             if metric_logger.should_log(train_state.step):
@@ -1389,8 +1483,10 @@ def main(job_config: JobConfig):
                 ):
                     loss = loss.detach()
                     ce_loss_total = ce_loss_total.detach()
+                    ce_unweighted_total = ce_unweighted_total.detach()
                     aux_loss_total = aux_loss_total.detach()
                     action_loss_total = action_loss_total.detach()
+                    target_prob_avg = target_prob_avg.detach()
                     # mi_lower_bound_total = mi_lower_bound_total.detach()
                     # Use dist_mean/max on the accumulated loss for the step
                     global_avg_loss, global_max_loss = (
@@ -1406,6 +1502,15 @@ def main(job_config: JobConfig):
                     global_avg_ce_loss = dist_utils.dist_mean(
                         ce_loss_total, world_mesh["dp_cp"]
                     )
+                    global_avg_ce_unweighted_loss = dist_utils.dist_mean(
+                        ce_unweighted_total, world_mesh["dp_cp"]
+                    )
+                    if dft_enabled:
+                        global_avg_target_prob = dist_utils.dist_mean(
+                            target_prob_avg, world_mesh["dp_cp"]
+                        )
+                    else:
+                        global_avg_target_prob = 0.0
                     
                     if job_config.future_encoder.enable:                       
                         # count = count_total.detach()
@@ -1436,6 +1541,8 @@ def main(job_config: JobConfig):
                     # Scale back the loss before logging
                     global_avg_loss = global_max_loss = loss.item()
                     global_avg_ce_loss = ce_loss_total.item()
+                    global_avg_ce_unweighted_loss = ce_unweighted_total.item()
+                    global_avg_target_prob = target_prob_avg.item() if dft_enabled else 0.0
                     if job_config.future_encoder.enable:
                         global_avg_aux_loss = aux_loss_total.item()
                         # global_avg_mi_lb = mi_lower_bound_total.item()
@@ -1481,12 +1588,21 @@ def main(job_config: JobConfig):
                     "optimizer/grad_norm": grad_norm.item(),
                     "optimizer/skipped_step": train_state.skipped_step,
                 }
+                if dft_enabled:
+                    extra_metrics["loss_ce_base"] = global_avg_ce_unweighted_loss
+                    extra_metrics["dft_avg_target_prob"] = (
+                        global_avg_target_prob
+                        if isinstance(global_avg_target_prob, float)
+                        else global_avg_target_prob.item()
+                    )
                 # Log future predictor lr if available (to reflect lr_scale / warmup overrides).
-                if future_predictor is not None and hasattr(optimizers, "optimizers"):
+                if future_predictor is not None and fp_idx is not None and hasattr(optimizers, "optimizers"):
                     try:
-                        fp_idx = model_parts.index(future_predictor)
                         fp_optim = optimizers.optimizers[fp_idx]
                         fp_lr = fp_optim.param_groups[0]["lr"]
+                        # Reflect warmup scaling if active.
+                        if fp_idx is not None and fp_warmup_steps > 0:
+                            fp_lr = fp_optim.param_groups[0]["fp_base_lr"] * fp_warmup_factor
                         extra_metrics["optimizer/lr_future_pred"] = fp_lr
                     except Exception:
                         pass

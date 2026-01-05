@@ -13,7 +13,8 @@ flame_origin
 OLMo
 OLMo*
 dolmino-50B
-omni-math 
+omni-math
+DFT
 # shell scripts
 *.sh
 *.pdf
