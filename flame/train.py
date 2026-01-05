@@ -1218,8 +1218,9 @@ def main(job_config: JobConfig):
                                 else:
                                     ce_loss_raw = output.loss
                                     ce_unweighted_mean = ce_loss_raw
-                            ce_loss = ce_loss_raw * inv_grad_acc_steps
-                            ce_unweighted_scaled = ce_unweighted_mean * inv_grad_acc_steps
+                            grad_scale = inv_grad_acc_steps if not dft_enabled else 1.0
+                            ce_loss = ce_loss_raw * grad_scale
+                            ce_unweighted_scaled = ce_unweighted_mean * grad_scale
                         # If action layer is enabled and ce_loss_weight is set (default 0), scale CE accordingly
                         ce_loss_weight = (
                             job_config.action_layer.ce_loss_weight
@@ -1432,6 +1433,20 @@ def main(job_config: JobConfig):
                 if target_prob_means
                 else torch.tensor(0.0, device=device)
             )
+            # For logging, keep losses per micro-batch average in DFT mode to mirror upstream trainer logs.
+            log_loss = (
+                loss if not dft_enabled else loss / job_config.training.gradient_accumulation_steps
+            )
+            log_ce_loss_total = (
+                ce_loss_total
+                if not dft_enabled
+                else ce_loss_total / job_config.training.gradient_accumulation_steps
+            )
+            log_ce_unweighted_total = (
+                ce_unweighted_total
+                if not dft_enabled
+                else ce_unweighted_total / job_config.training.gradient_accumulation_steps
+            )
             if action_metrics_count > 0:
                 action_metrics_avg = {
                     k: v / action_metrics_count for k, v in action_metrics_acc.items()
@@ -1487,23 +1502,26 @@ def main(job_config: JobConfig):
                     aux_loss_total = aux_loss_total.detach()
                     action_loss_total = action_loss_total.detach()
                     target_prob_avg = target_prob_avg.detach()
+                    log_loss = log_loss.detach()
+                    log_ce_loss_total = log_ce_loss_total.detach()
+                    log_ce_unweighted_total = log_ce_unweighted_total.detach()
                     # mi_lower_bound_total = mi_lower_bound_total.detach()
                     # Use dist_mean/max on the accumulated loss for the step
                     global_avg_loss, global_max_loss = (
                         dist_utils.dist_mean(
-                            loss,
+                            log_loss,
                             world_mesh["dp_cp"],
                         ),
                         dist_utils.dist_max(
-                            loss,
+                            log_loss,
                             world_mesh["dp_cp"],
                         ),
                     )
                     global_avg_ce_loss = dist_utils.dist_mean(
-                        ce_loss_total, world_mesh["dp_cp"]
+                        log_ce_loss_total, world_mesh["dp_cp"]
                     )
                     global_avg_ce_unweighted_loss = dist_utils.dist_mean(
-                        ce_unweighted_total, world_mesh["dp_cp"]
+                        log_ce_unweighted_total, world_mesh["dp_cp"]
                     )
                     if dft_enabled:
                         global_avg_target_prob = dist_utils.dist_mean(
@@ -1539,9 +1557,9 @@ def main(job_config: JobConfig):
                     
                 else:
                     # Scale back the loss before logging
-                    global_avg_loss = global_max_loss = loss.item()
-                    global_avg_ce_loss = ce_loss_total.item()
-                    global_avg_ce_unweighted_loss = ce_unweighted_total.item()
+                    global_avg_loss = global_max_loss = log_loss.item()
+                    global_avg_ce_loss = log_ce_loss_total.item()
+                    global_avg_ce_unweighted_loss = log_ce_unweighted_total.item()
                     global_avg_target_prob = target_prob_avg.item() if dft_enabled else 0.0
                     if job_config.future_encoder.enable:
                         global_avg_aux_loss = aux_loss_total.item()
