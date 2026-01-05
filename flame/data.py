@@ -641,7 +641,6 @@ class DataCollatorForLanguageModeling:
     tokenizer: PreTrainedTokenizer
     context_len: Optional[int] = None
     varlen: bool = False
-    respect_doc_boundaries: bool = False
 
     def __call__(self, examples: List[Union[List[int], Dict[str, Any]]]) -> Dict[str, Any]:
         if not isinstance(examples[0], Dict):
@@ -691,50 +690,6 @@ class DataCollatorForLanguageModeling:
             if 'attention_mask' in batch:
                 labels[batch['attention_mask'] == 0] = -100
             batch['labels'] = labels
-
-            # --- Compute batch-level cu_seqlens based on EOS tokens (if enabled) ---
-            # This allows future_encoder to respect document boundaries even in non-varlen mode
-            if self.respect_doc_boundaries and self.tokenizer.eos_token_id is not None:
-                cu_seqlens_list = []
-                for sample_input_ids in batch['input_ids']:
-                    # Find EOS token positions in this sample
-                    eos_positions = (sample_input_ids == self.tokenizer.eos_token_id).nonzero(as_tuple=False).squeeze(-1)
-
-                    if eos_positions.numel() == 0:
-                        # No EOS tokens, treat entire sequence as one document
-                        cu = torch.tensor([0, sample_input_ids.size(0)], dtype=torch.int32, device=sample_input_ids.device)
-                    else:
-                        # Build cu_seqlens from EOS positions
-                        # Documents are separated by EOS tokens: [doc1, EOS, doc2, EOS, ...]
-                        # cu_seqlens marks the start of each document and the end
-                        cu = torch.cat([
-                            torch.tensor([0], device=sample_input_ids.device),
-                            eos_positions + 1,  # Position after each EOS
-                        ], dim=0)
-
-                        # Add final position if last token is not EOS
-                        if cu[-1] != sample_input_ids.size(0):
-                            cu = torch.cat([cu, torch.tensor([sample_input_ids.size(0)], device=sample_input_ids.device)])
-
-                        cu = cu.to(dtype=torch.int32)
-
-                    cu_seqlens_list.append(cu)
-
-                # Pad cu_seqlens to same length across batch
-                max_len = max(cu.size(0) for cu in cu_seqlens_list)
-                cu_seqlens_padded = []
-                for cu in cu_seqlens_list:
-                    # Pad with -1 to indicate invalid entries
-                    padding = torch.full((max_len - cu.size(0),), -1, dtype=torch.int32, device=cu.device)
-                    cu_padded = torch.cat([cu, padding], dim=0)
-                    cu_seqlens_padded.append(cu_padded)
-
-                # Stack to [batch_size, max_num_docs+1]
-                batch['cu_seqlens'] = torch.stack(cu_seqlens_padded, dim=0)
-            else:
-                # Document boundaries not enabled or no EOS token
-                batch['cu_seqlens'] = None
-
         else:
             # --- Handling for varlen=True (Concatenated Sequences) ---
             if len(examples) > 1:
@@ -1110,7 +1065,6 @@ def build_dataloader(
     seq_len: int,
     context_len: Optional[int] = None,
     varlen: bool = False,
-    respect_doc_boundaries: bool = False,
     num_workers: int = 0,
     pin_memory: bool = False,
     persistent_workers: bool = False,
@@ -1140,7 +1094,6 @@ def build_dataloader(
             tokenizer=tokenizer,
             context_len=context_len,
             varlen=varlen,
-            respect_doc_boundaries=respect_doc_boundaries,
         ),
         num_workers=num_workers,
         pin_memory=pin_memory,

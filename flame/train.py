@@ -21,16 +21,6 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from fla.modules.fused_linear_cross_entropy import FusedLinearCrossEntropyLoss
 from fla.ops.utils import prepare_position_ids
-try:
-    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
-    _HAS_FLEX_ATTENTION = True
-except ImportError:  # pragma: no cover - flex_attention not available on older torch
-    _HAS_FLEX_ATTENTION = False
-try:
-    from transformers import AttentionInterface, AttentionMaskInterface
-    _HAS_FLEX_INTERFACE = False
-except Exception:  # pragma: no cover - older transformers
-    _HAS_FLEX_INTERFACE = False
 from torch.distributed.elastic.multiprocessing.errors import record
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.ft import FTParallelDims, init_ft_manager
@@ -54,9 +44,6 @@ from flame.config_manager import JobConfig
 from flame.data import build_dataloader, build_dataset
 from flame.models.parallelize_fla import apply_ddp, apply_fsdp, parallelize_fla
 from flame.models.pipeline_fla import pipeline_fla
-from flame.models.mi_estimator import build_mi_estimator
-from flame.models.future_predictor import FuturePredictorHead
-from flame.models.action_layer import ActionLayer
 from flame.tools.utils import get_nparams_and_flops
 
 
@@ -138,10 +125,6 @@ def _log_sample_preview(dataset, tokenizer, color, max_chars: int = 400, max_tok
 
 _MODEL_CONVERTER_HOOK_MODEL_PARTS = None
 _MODEL_CONVERTERS = None
-_BLOCK_MASK_CACHE: dict = {}
-_WARNED_NO_FLEX = False
-_FLEX_REG_DONE = False
-_FLEX_DEBUG = bool(int(os.environ.get("FLEX_DEBUG", "0")))
 
 
 def _optimizer_post_step_hook(*args, **kwargs):
@@ -167,306 +150,6 @@ def _ensure_cloudpickle_for_dist_objects():
     if getattr(dist_c10d, "_pickler", None) is not cloudpickle.CloudPickler:
         logger.info("Enabling cloudpickle for distributed object collectives")
         dist_c10d._pickler = cloudpickle.CloudPickler  # type: ignore[attr-defined]
-
-
-def build_future_attention_mask(
-    attention_mask: torch.Tensor,
-    dtype: torch.dtype,
-    window_k: int | None = None
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Build a padding-aware anti-causal attention mask and a validity mask for InfoNCE.
-
-    Args:
-        attention_mask: (B, T) with 1 for valid tokens, 0 for padding.
-        dtype: dtype to use for the additive mask.
-        window_k: Optional window size for future attention. If None, attend to all future tokens.
-    Returns:
-        future_attn_mask: (B, 1, T, T) additive mask, 0 where attending is allowed, large negative elsewhere.
-        future_valid: (B, T) bool mask where at least one valid future token exists.
-    """
-    bsz, seqlen = attention_mask.shape
-    device = attention_mask.device
-    neg_inf = -1e4
-
-    # Create position indices
-    positions = torch.arange(seqlen, device=device)
-
-    # Future-only mask: allow attending to positions strictly greater than t
-    # future_only[i, j] = True if j > i (anti-causal)
-    future_only = positions[None, :] > positions[:, None]  # [T, T]
-
-    # Apply window constraint if specified
-    if window_k is not None and window_k > 0:
-        # Also require j <= i + window_k
-        distance = positions[None, :] - positions[:, None]  # j - i
-        within_window = distance <= window_k
-        future_only = future_only & within_window
-
-    # Convert to additive mask
-    future_mask = torch.where(
-        future_only,
-        0.0,
-        neg_inf
-    ).to(dtype=dtype)  # [T, T]
-
-    # Expand to batch
-    future_mask = future_mask.unsqueeze(0).unsqueeze(0).expand(bsz, 1, seqlen, seqlen).contiguous()
-
-    # Apply padding mask
-    if attention_mask is not None:
-        pad_mask = (attention_mask == 0).to(dtype=dtype)
-        future_mask = future_mask + pad_mask[:, None, None, :] * neg_inf
-
-    # Valid positions are non-pad tokens that have at least one future valid token
-    if window_k is not None and window_k > 0:
-        # With window constraint: check if there's a valid future token within window (vectorized)
-        positions_i = torch.arange(seqlen, device=device)[:, None]  # [T, 1]
-        positions_j = torch.arange(seqlen, device=device)[None, :]  # [1, T]
-
-        # Check if j is in range (i, i+window_k] for each i
-        in_future = positions_j > positions_i  # j > i
-        in_window = positions_j <= positions_i + window_k  # j <= i + window_k
-        in_range = in_future & in_window  # [T, T]
-
-        # For each position i in each batch, check if any j in range is valid
-        future_exists = torch.einsum('bt,st->bs', attention_mask.float(), in_range.float()) > 0  # [B, T]
-        future_valid = future_exists & attention_mask.bool()
-    else:
-        # No window constraint: valid if there's any future token
-        token_lens = attention_mask.sum(dim=1)
-        max_valid_index = torch.clamp(token_lens - 1, min=0)
-        positions_batch = torch.arange(seqlen, device=device).unsqueeze(0)
-        future_valid = (positions_batch < max_valid_index.unsqueeze(1)) & attention_mask.bool()
-
-    return future_mask, future_valid
-
-
-def build_future_mask_from_batch_cu(
-    cu_seqlens: torch.Tensor,
-    attention_mask: torch.Tensor,
-    window_k: int | None,
-    dtype: torch.dtype
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Build document-aware anti-causal attention mask from batch-level cu_seqlens.
-    Optimized version with vectorized operations.
-
-    Args:
-        cu_seqlens: (B, max_num_docs+1) with -1 padding for invalid entries.
-                    Each row contains document boundaries for one sample.
-        attention_mask: (B, T) with 1 for valid tokens, 0 for padding.
-        window_k: Optional window size for future attention. If None, attend to all future in same doc.
-        dtype: dtype to use for the additive mask.
-
-    Returns:
-        future_attn_mask: (B, 1, T, T) additive mask, 0 where attending is allowed, large negative elsewhere.
-        future_valid: (B, T) bool mask where at least one valid future token exists within same document.
-    """
-    bsz, seqlen = attention_mask.shape
-    device = attention_mask.device
-    neg_inf = -1e4
-
-    # Initialize future mask: block everything initially
-    future_mask = torch.full(
-        (bsz, 1, seqlen, seqlen),
-        fill_value=neg_inf,
-        device=device,
-        dtype=dtype
-    )
-
-    # Initialize future_valid: no valid future initially
-    future_valid = torch.zeros((bsz, seqlen), dtype=torch.bool, device=device)
-
-    # Process each sample in the batch
-    for b in range(bsz):
-        cu = cu_seqlens[b]
-        # Filter out padding (-1)
-        valid_cu = cu[cu >= 0]
-
-        if valid_cu.numel() < 2:
-            continue
-
-        # For each document in this sample
-        for doc_idx in range(len(valid_cu) - 1):
-            doc_start = int(valid_cu[doc_idx].item())
-            doc_end = int(valid_cu[doc_idx + 1].item())
-
-            if doc_start >= doc_end:
-                continue
-
-            doc_len = doc_end - doc_start
-
-            # Create anti-causal mask for this document (vectorized)
-            # Position i attends to position j where j > i within the document
-            i_idx = torch.arange(doc_len, device=device)[:, None]  # [doc_len, 1]
-            j_idx = torch.arange(doc_len, device=device)[None, :]  # [1, doc_len]
-
-            # Anti-causal: j > i
-            doc_mask = (j_idx > i_idx).to(dtype=dtype)  # [doc_len, doc_len]
-
-            # Apply window constraint if specified
-            if window_k is not None and window_k > 0:
-                distance = j_idx - i_idx
-                doc_mask = doc_mask * (distance <= window_k).to(dtype=dtype)
-
-            # Convert to additive mask: 0 where allowed, neg_inf where blocked
-            doc_mask = torch.where(doc_mask > 0, 0.0, neg_inf)
-
-            # Place into the full mask
-            future_mask[b, 0, doc_start:doc_end, doc_start:doc_end] = doc_mask
-
-            # Mark positions with valid future (vectorized)
-            if window_k is not None and window_k > 0:
-                # Position i has valid future if min(i + window_k, doc_end - 1) > i
-                positions = torch.arange(doc_start, doc_end, device=device)
-                future_end = torch.minimum(
-                    positions + window_k,
-                    torch.tensor(doc_end - 1, device=device, dtype=positions.dtype)
-                )
-                has_future = future_end > positions
-                future_valid[b, doc_start:doc_end] = has_future
-            else:
-                # All positions except the last have valid future
-                future_valid[b, doc_start:doc_end-1] = True
-
-    # Apply padding mask
-    pad_mask = (attention_mask == 0).to(dtype=dtype)
-    future_mask = future_mask + pad_mask[:, None, None, :] * neg_inf
-
-    return future_mask, future_valid
-
-
-def _segment_ids_from_cu_seqlens(cu_seqlens: torch.Tensor) -> tuple[torch.Tensor, int]:
-    """
-    Derive segment ids for each token position from cu_seqlens.
-    Returns (segment_id, total_len).
-    """
-    if cu_seqlens.dim() == 2:
-        cu = cu_seqlens[0]
-    else:
-        cu = cu_seqlens
-    total_len = int(cu[-1].item())
-    positions = torch.arange(total_len, device=cu.device, dtype=cu.dtype)
-    segment_id = torch.bucketize(positions, cu[1:],right=True)
-    return segment_id, total_len
-
-
-def build_future_mask_from_cu(
-    cu_seqlens: torch.Tensor, window_k: int | None, dtype: torch.dtype, device: torch.device
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Build a dense additive mask (B=1) and future_valid from cu_seqlens for an anti-causal (+window) setting.
-    Mask shape: [1, 1, T, T], 0 for allowed, -inf otherwise. future_valid shape: [1, T].
-    """
-    cu = cu_seqlens[0] if cu_seqlens.dim() == 2 else cu_seqlens
-    if cu.numel() == 0 or cu[-1] == 0:
-        return None, None
-    segment_id, total_len = _segment_ids_from_cu_seqlens(cu)
-    pos = torch.arange(total_len, device=device, dtype=cu.dtype)
-    diff = pos[None, :] - pos[:, None]  # kv_idx - q_idx
-    same = segment_id[:, None] == segment_id[None, :]
-    future = diff > 0
-    if window_k is not None and window_k > 0:
-        future = future & (diff <= window_k)
-    allowed = same & future
-    neg_inf = -torch.finfo(dtype).max
-    mask = torch.full((total_len, total_len), fill_value=neg_inf, device=device, dtype=dtype)
-    mask = mask.masked_fill(allowed, 0.0).unsqueeze(0).unsqueeze(0)
-
-    seg_end = cu[segment_id + 1]
-    future_len = seg_end - pos - 1
-    if window_k is not None and window_k > 0:
-        future_len = torch.minimum(future_len, torch.tensor(window_k, device=device, dtype=future_len.dtype))
-    future_valid = (future_len > 0).unsqueeze(0)
-    return mask, future_valid
-
-
-def _future_valid_from_cu(cu_seqlens: torch.Tensor, window_k: int | None, device: torch.device) -> torch.Tensor | None:
-    """Compute future_valid mask [1, T] from cu_seqlens with optional window; return None if empty."""
-    cu = cu_seqlens[0] if cu_seqlens.dim() == 2 else cu_seqlens
-    if cu.numel() == 0 or cu[-1] == 0:
-        return None
-    pos = torch.arange(cu[-1], device=device, dtype=cu.dtype)
-    seg_end = cu[torch.bucketize(pos, cu[1:], right=True) + 1]
-    future_len = seg_end - pos - 1
-    if window_k not in (None, 0):
-        future_len = torch.minimum(future_len, torch.tensor(window_k, device=device, dtype=cu.dtype))
-    return (future_len > 0).unsqueeze(0)
-
-
-def _register_future_flex_attn():
-    """Register a flex attention implementation for future (anti-causal) masks."""
-    global _FLEX_REG_DONE
-    if _FLEX_REG_DONE or not (_HAS_FLEX_ATTENTION and _HAS_FLEX_INTERFACE):
-        return
-
-    def future_flex_attention_forward(module, query, key, value, attention_mask=None, **kwargs):
-        # attention_mask here is expected to be a BlockMask
-        # Handle grouped-query attention: flex_attention expects the same head count for q and k/v.
-        if query.size(1) != key.size(1):
-            repeat_factor = query.size(1) // key.size(1)
-            key = key.repeat_interleave(repeat_factor, dim=1)
-            value = value.repeat_interleave(repeat_factor, dim=1)
-        out = flex_attention(query, key, value, block_mask=attention_mask)
-        return out, None
-
-    def future_flex_block_mask(
-        batch_size: int,
-        cache_position,
-        kv_length: int,
-        kv_offset: int = 0,
-        mask_function=None,
-        attention_mask=None,
-        cu_seqlens=None,
-        future_window_k=None,
-        **kwargs,
-    ):
-        # If caller already provided a BlockMask, just reuse it.
-        if attention_mask is not None and attention_mask.__class__.__name__ == "BlockMask":
-            return attention_mask
-        # Otherwise try to build from cu_seqlens if available.
-        if cu_seqlens is None:
-            # Fallback to causal mask construction from attention_mask if nothing else is available.
-            return None
-        cu = cu_seqlens[0] if cu_seqlens.dim() == 2 else cu_seqlens
-        if cu.numel() == 0 or cu[-1] == 0:
-            return None
-        device = cache_position.device
-        cu = cu.to(device)
-        total_len = int(cu[-1].item())
-        positions = torch.arange(total_len, device=device, dtype=cu.dtype)
-        segment_id = torch.bucketize(positions, cu[1:],right=True)
-        config = kwargs.get("config", None)
-        cfg_window = getattr(config, "_future_window_k", None) if config is not None else None
-        future_window = future_window_k if future_window_k not in (None, 0) else cfg_window
-
-        def mask_mod(_b, _h, q_idx, kv_idx):
-            same = segment_id[q_idx] == segment_id[kv_idx]
-            future = kv_idx > q_idx
-            if future_window is not None:
-                future = future & (kv_idx - q_idx <= future_window)
-            return same & future
-
-        H = config.num_attention_heads if config is not None else 1
-        B = batch_size
-        key = (
-            device,
-            B,
-            H,
-            total_len,
-            future_window,
-            tuple(cu.cpu().tolist()),
-        )
-        block_mask = _BLOCK_MASK_CACHE.get(key)
-        if block_mask is None or block_mask.device != device:
-            block_mask = create_block_mask(mask_mod, B, H, total_len, total_len, device=device)
-            _BLOCK_MASK_CACHE[key] = block_mask
-        return block_mask
-
-    AttentionInterface.register("future_flex", future_flex_attention_forward)
-    AttentionMaskInterface.register("future_flex", future_flex_block_mask)
-    _FLEX_REG_DONE = True
 
 
 def _parallelize_aux_module(module, world_mesh, parallel_dims, job_config):
@@ -533,18 +216,8 @@ def main(job_config: JobConfig):
             f"{color.green}{json.dumps(job_config.to_dict(), indent=2, sort_keys=True)}{color.reset}"
         )
 
-    # Enable DFT loss mode and disable auxiliary future/action modules when requested.
+    # Enable DFT loss mode if configured.
     dft_enabled = bool(getattr(job_config, "dft", None) and job_config.dft.enable)
-    if dft_enabled:
-        if getattr(job_config.future_encoder, "enable", False):
-            logger.info("DFT enabled: disabling future_encoder (MI teacher forward).")
-            job_config.future_encoder.enable = False
-        if getattr(job_config.future_predictor, "enable", False):
-            logger.info("DFT enabled: disabling future_predictor head.")
-            job_config.future_predictor.enable = False
-        if getattr(job_config.action_layer, "enable", False):
-            logger.info("DFT enabled: disabling action_layer.")
-            job_config.action_layer.enable = False
 
     # take control of garbage collection to avoid stragglers
     gc_handler = utils.GarbageCollection(gc_freq=job_config.training.gc_freq)
@@ -679,7 +352,6 @@ def main(job_config: JobConfig):
         seq_len=job_config.training.seq_len,
         context_len=job_config.training.context_len,
         varlen=job_config.training.varlen,
-        respect_doc_boundaries=job_config.future_encoder.respect_doc_boundaries,
         num_workers=job_config.training.num_workers,
         pin_memory=job_config.training.pin_memory,
         persistent_workers=job_config.training.persistent_workers,
@@ -802,73 +474,6 @@ def main(job_config: JobConfig):
 
         model_parts = [model]
 
-    # Initialize Future predictor and MI Estimator if enabled
-    mi_estimator = None
-    future_predictor = None
-    action_layer = None
-    if job_config.future_encoder.enable:
-        logger.info("Initializing Future Predictor and MI Estimator...")
-        if job_config.future_predictor.enable:
-            future_predictor = FuturePredictorHead(
-                hidden_size=model_config.hidden_size,
-                head_type=job_config.future_predictor.head_type,
-                dropout=job_config.future_predictor.dropout,
-            )
-            future_predictor.to(init_device)
-            future_predictor.train()
-            if len(list(future_predictor.parameters())) > 0:
-                _parallelize_aux_module(
-                    future_predictor, world_mesh, parallel_dims, job_config
-                )
-                model_parts.append(future_predictor)
-
-        mi_estimator = build_mi_estimator(
-            estimator_type=job_config.future_encoder.estimator_type,
-            hidden_size=model_config.hidden_size,
-            temperature=job_config.future_encoder.temperature,
-        )
-        mi_estimator.to(init_device)
-        mi_estimator.train()
-        if len(list(mi_estimator.parameters())) > 0:
-            _parallelize_aux_module(mi_estimator, world_mesh, parallel_dims, job_config)
-            model_parts.append(mi_estimator)
-
-    if job_config.action_layer.enable:
-        if not job_config.future_encoder.enable:
-            raise ValueError("Action layer requires future_encoder.enable for future summaries.")
-        use_rms_norm = job_config.action_layer.use_rms_norm
-        if not use_rms_norm:
-            use_rms_norm = bool(
-                getattr(model_config, "norm_type", "").lower() == "rmsnorm"
-                or hasattr(model_config, "rms_norm_eps")
-            )
-        ffn_hidden_size = job_config.action_layer.ffn_hidden_size
-        if ffn_hidden_size is None:
-            ffn_hidden_size = getattr(model_config, "intermediate_size", None)
-        activation = job_config.action_layer.activation
-        if activation is None:
-            activation = getattr(model_config, "hidden_act", None)
-        action_layer = ActionLayer(
-            hidden_size=model_config.hidden_size,
-            top_k=job_config.action_layer.top_k,
-            head_type=job_config.action_layer.head_type,
-            tau=job_config.action_layer.tau,
-            reward_clamp=job_config.action_layer.reward_clamp,
-            mean_threshold=job_config.action_layer.mean_threshold,
-            gt_bias=job_config.action_layer.gt_bias,
-            use_rms_norm=use_rms_norm,
-            ffn_hidden_size=ffn_hidden_size,
-            activation=activation,
-            residual=job_config.action_layer.residual,
-            delta_init_zero=job_config.action_layer.delta_init_zero,
-            score_type=job_config.action_layer.score_type,
-        )
-        action_layer.to(init_device)
-        action_layer.train()
-        if len(list(action_layer.parameters())) > 0:
-            _parallelize_aux_module(action_layer, world_mesh, parallel_dims, job_config)
-            model_parts.append(action_layer)
-
     device_mem_stats = device_memory_monitor.get_peak_stats()
     logger.info(
         f"{device_type.upper()} memory usage for model: "
@@ -889,27 +494,6 @@ def main(job_config: JobConfig):
         else model_parts
     )
     optimizers = train_spec.build_optimizers_fn(optim_model_parts, job_config, ft_manager)
-
-    # Optionally scale LR / override weight decay for the future predictor only.
-    fp_lr_scale = getattr(job_config.future_predictor, "lr_scale", 1.0)
-    fp_wd_override = getattr(job_config.future_predictor, "weight_decay", None)
-    fp_idx = None
-    if future_predictor is not None and hasattr(optimizers, "optimizers"):
-        try:
-            fp_idx = model_parts.index(future_predictor)
-            fp_optim = optimizers.optimizers[fp_idx]
-            for pg in fp_optim.param_groups:
-                if fp_lr_scale != 1.0:
-                    pg["lr"] = pg["lr"] * fp_lr_scale
-                if fp_wd_override is not None:
-                    pg["weight_decay"] = fp_wd_override
-            logger.info(
-                f"Applied lr_scale={fp_lr_scale} "
-                f"{'and weight_decay='+str(fp_wd_override) if fp_wd_override is not None else ''} "
-                "to future_predictor optimizer"
-            )
-        except Exception as exc:  # pragma: no cover - defensive fallback
-            logger.warning(f"Failed to apply lr/wd override to future_predictor: {exc}")
 
     lr_schedulers = train_spec.build_lr_schedulers_fn(optimizers, job_config)
     # Post optimizer step model converters hook.
@@ -1034,32 +618,11 @@ def main(job_config: JobConfig):
 
             optimizers.zero_grad()
 
-            # Apply future predictor warmup scaling (on top of lr_scale).
-            fp_warmup_steps = getattr(job_config.future_predictor, "warmup_steps", 0)
-            fp_warmup_factor = 1.0
-            if (
-                fp_idx is not None
-                and fp_warmup_steps > 0
-                and hasattr(optimizers, "optimizers")
-            ):
-                fp_warmup_factor = min(1.0, train_state.step / fp_warmup_steps)
-                try:
-                    fp_optim = optimizers.optimizers[fp_idx]
-                    for pg in fp_optim.param_groups:
-                        base_lr = pg.get("fp_base_lr", pg["lr"])
-                        pg["lr"] = base_lr * fp_warmup_factor
-                except Exception as exc:  # pragma: no cover - defensive fallback
-                    logger.warning(f"Failed to apply future predictor warmup lr: {exc}")
-
             inv_grad_acc_steps = 1.0 / job_config.training.gradient_accumulation_steps
             losses = []
             ce_losses = []
             ce_unweighted_losses = []
             target_prob_means = []
-            aux_losses = []
-            action_losses = []
-            action_metrics_acc = {}
-            action_metrics_count = 0
             # mi_lower_bounds = []
             # counts = []
             # do gradient accumulation if enabled
@@ -1167,7 +730,7 @@ def main(job_config: JobConfig):
                             position_ids=position_ids,
                             attention_mask=attention_mask,
                             cu_seqlens=cu_seqlens,
-                            output_hidden_states=job_config.future_encoder.enable,
+                            output_hidden_states=False,
                             use_cache=False,
                         )
                         if not freeze_lm_for_infonce and not dft_enabled:
@@ -1220,191 +783,8 @@ def main(job_config: JobConfig):
                                     ce_unweighted_mean = ce_loss_raw
                             ce_loss = ce_loss_raw * inv_grad_acc_steps
                             ce_unweighted_scaled = ce_unweighted_mean * inv_grad_acc_steps
-                        # If action layer is enabled and ce_loss_weight is set (default 0), scale CE accordingly
-                        ce_loss_weight = (
-                            job_config.action_layer.ce_loss_weight
-                            if job_config.action_layer.enable and not freeze_lm_for_infonce
-                            else (0.0 if freeze_lm_for_infonce else 1.0)
-                        )
-                        scaled_ce = ce_loss * ce_loss_weight
+                        scaled_ce = ce_loss
                         total_loss = scaled_ce
-
-                        aux_loss = torch.tensor(0.0, device=device)
-                        aux_loss_scaled = torch.tensor(0.0, device=device)
-                        action_loss_scaled = torch.tensor(0.0, device=device)
-                        action_metrics_step = None
-                        future_summaries = None
-                        future_valid = None
-                        future_summaries_detached = None
-
-                        if job_config.future_encoder.enable:
-                            future_summaries_detached = None
-                            future_valid = None
-                            hidden_states = output.hidden_states[-1]
-                            teacher_dtype = hidden_states.dtype
-                            # ensure position_ids are 2D for HF attention path
-                            future_position_ids = position_ids
-                            if future_position_ids is not None and future_position_ids.dim() == 1:
-                                future_position_ids = future_position_ids.unsqueeze(0)
-                            # Run a second forward (no grad) with anti-causal (+window) mask to get teacher summaries.
-                            future_window_k = job_config.future_encoder.future_k
-                            if _FLEX_DEBUG and cu_seqlens is not None and _HAS_FLEX_ATTENTION and _HAS_FLEX_INTERFACE:
-                                logger.info(
-                                    f"[flex_debug] step?_future pass varlen len={int(cu_seqlens.view(-1)[-1])} window={future_window_k}"
-                                )
-                            if cu_seqlens is not None and _HAS_FLEX_ATTENTION and _HAS_FLEX_INTERFACE:
-                                _register_future_flex_attn()
-                                prev_impl = getattr(model.config, "_attn_implementation", None)
-                                prev_window = getattr(model.config, "_future_window_k", None)
-                                model.config._attn_implementation = "future_flex"
-                                model.config._future_window_k = future_window_k if future_window_k != 0 else None
-                                if hasattr(model, "model") and hasattr(model.model, "config"):
-                                    model.model.config._attn_implementation = model.config._attn_implementation
-                                    model.model.config._future_window_k = model.config._future_window_k
-                                future_forward_kwargs = dict(
-                                    input_ids=input_ids,
-                                    position_ids=future_position_ids,
-                                    cu_seqlens=cu_seqlens,
-                                    attention_mask=None,
-                                    output_hidden_states=True,
-                                    use_cache=False,
-                                )
-                                if _FLEX_DEBUG:
-                                    logger.info(
-                                        f"[flex_debug] future flex forward using impl=future_flex window={model.config._future_window_k} "
-                                        f"cu_seqlens_len={int(cu_seqlens.view(-1)[-1])} pos_shape={tuple(future_position_ids.shape)}"
-                                    )
-                                with torch.no_grad():
-                                    future_output = model(**future_forward_kwargs)
-                                    future_summaries_detached = future_output.hidden_states[-1].detach()
-                                model.config._attn_implementation = prev_impl
-                                model.config._future_window_k = prev_window
-                                if hasattr(model, "model") and hasattr(model.model, "config"):
-                                    model.model.config._attn_implementation = prev_impl
-                                    model.model.config._future_window_k = prev_window
-                                # Build validity mask: length of allowed future tokens per position
-                                future_valid = _future_valid_from_cu(
-                                    cu_seqlens,
-                                    window_k=future_window_k if future_window_k != 0 else None,
-                                    device=input_ids.device,
-                                )
-                                if future_valid is None:
-                                    future_valid = torch.zeros(
-                                        (hidden_states.size(0), hidden_states.size(1)),
-                                        dtype=torch.bool,
-                                        device=hidden_states.device,
-                                    )
-                            elif cu_seqlens is not None and cu_seqlens.dim() == 1:
-                                # Fallback dense future mask for varlen
-                                future_mask, future_valid = build_future_mask_from_cu(
-                                    cu_seqlens,
-                                    window_k=future_window_k if future_window_k != 0 else None,
-                                    dtype=teacher_dtype,
-                                    device=input_ids.device,
-                                )
-                                if future_mask is None or future_valid is None:
-                                    future_valid = torch.zeros(
-                                        (hidden_states.size(0), hidden_states.size(1)),
-                                        dtype=torch.bool,
-                                        device=hidden_states.device,
-                                    )
-                                    future_summaries_detached = torch.zeros_like(hidden_states)
-                                else:
-                                    future_forward_kwargs = dict(
-                                        input_ids=input_ids,
-                                        position_ids=future_position_ids,
-                                        attention_mask=future_mask,
-                                        output_hidden_states=True,
-                                        use_cache=False,
-                                    )
-                                    if _FLEX_DEBUG:
-                                        logger.info(
-                                            f"[flex_debug] future dense forward window={future_window_k} mask_shape={tuple(future_mask.shape)} "
-                                            f"cu_seqlens_len={int(cu_seqlens.view(-1)[-1])}"
-                                        )
-                                    with torch.no_grad():
-                                        future_output = model(**future_forward_kwargs)
-                                        future_summaries_detached = future_output.hidden_states[-1].detach()
-                            elif attention_mask is not None:
-                                # Non-varlen path: check if we should use document-aware mask
-                                respect_doc_boundaries = job_config.future_encoder.respect_doc_boundaries
-                                if respect_doc_boundaries and cu_seqlens is not None and cu_seqlens.dim() == 2:
-                                    # Use document-aware future mask based on EOS tokens
-                                    future_attn_mask, future_valid = build_future_mask_from_batch_cu(
-                                        cu_seqlens=cu_seqlens,
-                                        attention_mask=attention_mask,
-                                        window_k=future_window_k if future_window_k != 0 else None,
-                                        dtype=torch.float32
-                                    )
-                                else:
-                                    # Fallback: simple future mask without document boundaries
-                                    future_attn_mask, future_valid = build_future_attention_mask(
-                                        attention_mask=attention_mask,
-                                        dtype=torch.float32,
-                                        window_k=future_window_k if future_window_k != 0 else None
-                                    )
-                                with torch.no_grad():
-                                    future_output = model(
-                                        input_ids=input_ids,
-                                        position_ids=position_ids,
-                                        attention_mask=future_attn_mask,
-                                        output_hidden_states=True,
-                                        use_cache=False,
-                                    )
-                                    future_summaries_detached = future_output.hidden_states[-1].detach()
-                            if future_valid is not None and future_predictor is not None and mi_estimator is not None:
-                                hidden_states = output.hidden_states[-1]
-                                # Align targets to future positions (t -> t+k) to avoid using the current token's residual.
-                                shift_k = max(1, getattr(job_config.future_encoder, "shift_k", 1))
-                                if shift_k > 1:
-                                    # Sample a random shift in [1, shift_k] each step to increase difficulty/diversity.
-                                    shift = int(torch.randint(1, shift_k + 1, (1,), device=hidden_states.device).item())
-                                else:
-                                    shift = 1
-                                if hidden_states.size(1) > shift:
-                                    predicted_future = future_predictor(hidden_states[:, :-shift, :])
-                                    future_target = future_summaries_detached[:, shift:, :]
-                                    future_valid_shifted = future_valid[:, :-shift] if future_valid is not None else None
-                                    aux_loss = mi_estimator(
-                                        predicted_future,
-                                        future_target,
-                                        valid_mask=future_valid_shifted,
-                                    )
-                                    aux_loss_scaled = (
-                                        aux_loss
-                                        * inv_grad_acc_steps
-                                        * job_config.future_encoder.loss_weight
-                                    )
-                                else:
-                                    aux_loss = torch.tensor(0.0, device=device)
-                                    aux_loss_scaled = torch.tensor(0.0, device=device)
-                                if metric_logger.should_log(train_state.step) and dist.get_rank() == 0:
-                                    valid_tokens = future_valid.sum().item() if future_valid is not None else 0
-                                    logger.info(
-                                        f"raw_aux={aux_loss.item():.4f}, scaled={aux_loss_scaled.item():.4f}, "
-                                        f"valid_tokens={valid_tokens}"
-                                        f' log(valid_count) * (1/grad_acc_steps) * loss_weight={math.log(valid_tokens) * inv_grad_acc_steps * job_config.future_encoder.loss_weight if valid_tokens > 0 else 0.0}'
-                                    )
-                        total_loss = total_loss + aux_loss_scaled
-
-                        if action_layer is not None:
-                            if future_summaries_detached is None:
-                                raise ValueError("Future summaries are required for the action layer but were not computed.")
-                            rl_loss, action_metrics_step = action_layer(
-                                logits=output.logits,
-                                hidden_states=hidden_states,
-                                labels=labels,
-                                future_summaries=future_summaries_detached,
-                                future_valid=future_valid,
-                                embed_weight=model.get_input_embeddings().weight,
-                                attention_mask=attention_mask,
-                            )
-                            action_loss_scaled = (
-                                rl_loss
-                                * inv_grad_acc_steps
-                                * job_config.action_layer.loss_weight
-                            )
-                            total_loss = total_loss + action_loss_scaled
 
                         total_loss.backward()
 
@@ -1413,36 +793,17 @@ def main(job_config: JobConfig):
                 ce_unweighted_losses.append(ce_unweighted_scaled.detach())
                 if dft_enabled:
                     target_prob_means.append(target_prob_mean.detach())
-                aux_losses.append(aux_loss_scaled.detach())
-                action_losses.append(action_loss_scaled.detach())
-                if action_metrics_step is not None:
-                    for k, v in action_metrics_step.items():
-                        action_metrics_acc[k] = action_metrics_acc.get(k, 0.0) + v.detach()
-                    action_metrics_count += 1
                 # mi_lower_bounds.append(mi_lower_bound.detach())
                 # counts.append(count.detach())
 
             loss = sum(losses)
             ce_loss_total = sum(ce_losses)
             ce_unweighted_total = sum(ce_unweighted_losses)
-            aux_loss_total = sum(aux_losses)
-            action_loss_total = sum(action_losses)
             target_prob_avg = (
                 sum(target_prob_means) / len(target_prob_means)
                 if target_prob_means
                 else torch.tensor(0.0, device=device)
             )
-            if action_metrics_count > 0:
-                action_metrics_avg = {
-                    k: v / action_metrics_count for k, v in action_metrics_acc.items()
-                }
-            else:
-                action_metrics_avg = {
-                    k: torch.tensor(0.0, device=device)
-                    for k in ["avg_reward", "max_reward", "avg_action_size"]
-                }
-            # mi_lower_bound_total = sum(mi_lower_bounds)
-            # count_total = sum(counts)
 
             # clip gradients
             grad_norm = dist_utils.clip_grad_norm_(
@@ -1465,14 +826,6 @@ def main(job_config: JobConfig):
             else:
                 optimizers.step()
             lr_schedulers.step()
-            # Store base lr for fp after scheduler step so next iteration warmup scales from scheduler value.
-            if fp_idx is not None and hasattr(optimizers, "optimizers"):
-                try:
-                    fp_optim = optimizers.optimizers[fp_idx]
-                    for pg in fp_optim.param_groups:
-                        pg["fp_base_lr"] = pg["lr"]
-                except Exception:
-                    pass
 
             # log metrics - Use MetricsProcessor
             if metric_logger.should_log(train_state.step):
@@ -1484,8 +837,6 @@ def main(job_config: JobConfig):
                     loss = loss.detach()
                     ce_loss_total = ce_loss_total.detach()
                     ce_unweighted_total = ce_unweighted_total.detach()
-                    aux_loss_total = aux_loss_total.detach()
-                    action_loss_total = action_loss_total.detach()
                     target_prob_avg = target_prob_avg.detach()
                     # mi_lower_bound_total = mi_lower_bound_total.detach()
                     # Use dist_mean/max on the accumulated loss for the step
@@ -1512,53 +863,12 @@ def main(job_config: JobConfig):
                     else:
                         global_avg_target_prob = 0.0
                     
-                    if job_config.future_encoder.enable:                       
-                        # count = count_total.detach()
-                        # global_count = dist_utils.dist_sum(count, world_mesh["dp_cp"])
-                        global_avg_aux_loss = dist_utils.dist_mean(aux_loss_total, world_mesh["dp_cp"])
-                        # global_avg_mi_lb = dist_utils.dist_mean(mi_lower_bound_total, world_mesh["dp_cp"])
-                    else:
-                        global_avg_aux_loss = 0.0
-                        global_avg_mi_lb = 0.0
-                    if job_config.action_layer.enable:
-                        global_avg_action_loss = dist_utils.dist_mean(action_loss_total, world_mesh["dp_cp"])
-                        global_avg_action_reward = dist_utils.dist_mean(
-                            action_metrics_avg["avg_reward"].detach(), world_mesh["dp_cp"]
-                        )
-                        global_avg_action_size = dist_utils.dist_mean(
-                            action_metrics_avg["avg_action_size"].detach(), world_mesh["dp_cp"]
-                        )
-                        global_max_action_reward = dist_utils.dist_max(
-                            action_metrics_avg["max_reward"].detach(), world_mesh["dp_cp"]
-                        )
-                    else:
-                        global_avg_action_loss = 0.0
-                        global_avg_action_reward = 0.0
-                        global_avg_action_size = 0.0
-                        global_max_action_reward = 0.0
-                    
                 else:
                     # Scale back the loss before logging
                     global_avg_loss = global_max_loss = loss.item()
                     global_avg_ce_loss = ce_loss_total.item()
                     global_avg_ce_unweighted_loss = ce_unweighted_total.item()
                     global_avg_target_prob = target_prob_avg.item() if dft_enabled else 0.0
-                    if job_config.future_encoder.enable:
-                        global_avg_aux_loss = aux_loss_total.item()
-                        # global_avg_mi_lb = mi_lower_bound_total.item()
-                    else:
-                        global_avg_aux_loss = 0.0
-                        # global_avg_mi_lb = 0.0
-                    if job_config.action_layer.enable:
-                        global_avg_action_loss = action_loss_total.item()
-                        global_avg_action_reward = action_metrics_avg["avg_reward"].item()
-                        global_avg_action_size = action_metrics_avg["avg_action_size"].item()
-                        global_max_action_reward = action_metrics_avg["max_reward"].item()
-                    else:
-                        global_avg_action_loss = 0.0
-                        global_avg_action_reward = 0.0
-                        global_avg_action_size = 0.0
-                        global_max_action_reward = 0.0
 
                 # Update train state tokens and elapsed time
                 time_now = time.perf_counter()
@@ -1595,26 +905,6 @@ def main(job_config: JobConfig):
                         if isinstance(global_avg_target_prob, float)
                         else global_avg_target_prob.item()
                     )
-                # Log future predictor lr if available (to reflect lr_scale / warmup overrides).
-                if future_predictor is not None and fp_idx is not None and hasattr(optimizers, "optimizers"):
-                    try:
-                        fp_optim = optimizers.optimizers[fp_idx]
-                        fp_lr = fp_optim.param_groups[0]["lr"]
-                        # Reflect warmup scaling if active.
-                        if fp_idx is not None and fp_warmup_steps > 0:
-                            fp_lr = fp_optim.param_groups[0]["fp_base_lr"] * fp_warmup_factor
-                        extra_metrics["optimizer/lr_future_pred"] = fp_lr
-                    except Exception:
-                        pass
-
-                if job_config.future_encoder.enable:
-                    extra_metrics["aux_loss"] = global_avg_aux_loss
-                    # extra_metrics["mi_lower_bound"] = global_avg_mi_lb
-                if job_config.action_layer.enable:
-                    extra_metrics["action_loss"] = global_avg_action_loss
-                    extra_metrics["action_avg_reward"] = global_avg_action_reward
-                    extra_metrics["action_avg_size"] = global_avg_action_size
-                    extra_metrics["action_max_reward"] = global_max_action_reward
 
                 metric_logger.log(
                     train_state.step,
