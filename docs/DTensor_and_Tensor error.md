@@ -4,9 +4,107 @@ need to convert all torch.Tensor to DTensor before calling distributed operators
 ```
 
 
-
+## DTensor简单学习
 DTensor is a torch.Tensor subclass. This means once a DTensor is created, it could be used in very similar way to torch.Tensor, including running different types of PyTorch operators as if running them in a single device, allowing proper distributed computation for PyTorch operators.
 
+```md
+## 2D DeviceMesh 简洁理解
+
+**核心一句话：**
+
+> 2D DeviceMesh = 把 GPU 组织成“行 × 列”的网格，每一维对应一种并行方式
+
+---
+
+## 1. 结构
+
+例子（8 卡）：
+
+```
+
+GPU0 GPU1 GPU2 GPU3
+GPU4 GPU5 GPU6 GPU7
+
+```
+```
+
+dim0（行） → 通常表示 Data Parallel（DP / FSDP）
+dim1（列） → 通常表示 Tensor Parallel（TP）
+
+```
+
+---
+
+## 2. 分组方式
+
+- **同一行（→）**：一个 TP group  
+- **同一列（↓）**：一个 DP group  
+
+```
+
+TP groups:
+[GPU0 GPU1 GPU2 GPU3]
+[GPU4 GPU5 GPU6 GPU7]
+
+DP groups:
+[GPU0 GPU4]
+[GPU1 GPU5]
+[GPU2 GPU6]
+[GPU3 GPU7]
+
+````
+
+---
+
+## 3. Placement（分布方式）
+
+每个维度对应一个 placement：
+
+```python
+placements = [dim0, dim1]
+````
+
+常见组合：
+
+### （1）DP replicate + TP shard
+
+```python
+[Replicate(), Shard(dim=0)]
+```
+
+* DP：复制
+* TP：切分
+
+👉 典型 Tensor Parallel
+
+---
+
+### （2）DP shard + TP replicate
+
+```python
+[Shard(dim=0), Replicate()]
+```
+
+* DP：分片（FSDP）
+* TP：复制
+
+👉 典型 FSDP
+
+---
+
+## 4. 本质理解
+
+> DeviceMesh 定义“设备怎么组织”，
+> Placement 定义“张量怎么分布”。
+
+---
+
+## 5. 一句话总结
+
+> 2D mesh 本质是：**两个并行维度的组合（如 DP × TP），每一维独立控制分布策略。**
+
+```
+```
 
 
 
