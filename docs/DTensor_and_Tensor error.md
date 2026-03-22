@@ -13,7 +13,7 @@ DTensor follows the SPMD (single program, multiple data) programming model to em
 
 哪些设备参与分布式（拓扑）
 
-```Placement``` describes the sharding layout of the logical tensor on the DeviceMesh. DTensor supports three types of placements: Shard, Replicate and Partial. 
+```Placement``` describes the sharding layout of the logical tensor on the DeviceMesh. DTensor supports three types of placements: ```Shard```, ```Replicate``` and ```Partial```. 
 
 张量在这些设备上怎么分布（规则）
 
