@@ -1,3 +1,15 @@
+、、、bash
+[rank0]:RuntimeError: aten._foreach_norm.Scalar: got mixed torch.Tensor and DTensor, need to convert all torch.Tensor to DTensor before calling distributed operators!
+```
+
+
+
+DTensor is a torch.Tensor subclass. This means once a DTensor is created, it could be used in very similar way to torch.Tensor, including running different types of PyTorch operators as if running them in a single device, allowing proper distributed computation for PyTorch operators.
+
+
+
+
+
 把你这两组 debug 放在一起，完整逻辑其实很清楚：
 
 ```python
