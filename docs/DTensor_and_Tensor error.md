@@ -4,10 +4,10 @@ need to convert all torch.Tensor to DTensor before calling distributed operators
 ```
 
 
-## DTensor简单学习
+# DTensor简单学习
 DTensor is a torch.Tensor subclass. This means once a DTensor is created, it could be used in very similar way to torch.Tensor, including running different types of PyTorch operators as if running them in a single device, allowing proper distributed computation for PyTorch operators.
 
-```md
+
 ## 2D DeviceMesh 简洁理解
 
 **核心一句话：**
