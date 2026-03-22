@@ -7,6 +7,11 @@ need to convert all torch.Tensor to DTensor before calling distributed operators
 # DTensor简单学习
 DTensor is a torch.Tensor subclass. This means once a DTensor is created, it could be used in very similar way to torch.Tensor, including running different types of PyTorch operators as if running them in a single device, allowing proper distributed computation for PyTorch operators.
 
+DTensor follows the SPMD (single program, multiple data) programming model to empower users to write distributed program as if it’s a single-device program with the same convergence property. It provides a uniform tensor sharding layout (DTensor Layout) through specifying the DeviceMesh and Placement:
+
+DeviceMesh represents the device topology and the communicators of the cluster using an n-dimensional array. (哪些设备参与分布式（拓扑）)
+
+Placement describes the sharding layout of the logical tensor on the DeviceMesh. DTensor supports three types of placements: Shard, Replicate and Partial. (张量在这些设备上怎么分布（规则）)
 
 ## 2D DeviceMesh 简洁理解
 
