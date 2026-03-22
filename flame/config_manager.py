@@ -621,6 +621,11 @@ class JobConfig:
                 dotted import module  (e.g., some_package.model_x).
             """,
         )
+        self.parser.add_argument(
+            "--experimental.freeze_lm_for_infonce",
+            action="store_true",
+            help="Freeze the LM backbone and skip CE loss; only train future predictor/MI head for sanity checks.",
+        )
         # checkpointing configs
         self.parser.add_argument(
             "--checkpoint.enable_checkpoint",
@@ -795,6 +800,12 @@ class JobConfig:
             help="Horizon for future summary. If -1, use all remaining tokens.",
         )
         self.parser.add_argument(
+            "--future_encoder.shift_k",
+            type=int,
+            default=1,
+            help="Positive horizon shift for MI targets. If >1, a random shift in [1, shift_k] is sampled each step.",
+        )
+        self.parser.add_argument(
             "--future_encoder.summary_method",
             type=str,
             default="mean",
@@ -819,6 +830,47 @@ class JobConfig:
             type=float,
             default=0.1,
             help="Weight of the auxiliary Future Encoder loss.",
+        )
+        self.parser.add_argument(
+            "--future_encoder.respect_doc_boundaries",
+            action="store_true",
+            default=False,
+            help="Whether to respect document boundaries in future attention mask. "
+                 "When enabled, uses batch-level cu_seqlens to prevent cross-document attention. "
+                 "Significantly slower (~37%%) but more accurate. Most pre-training disables this.",
+        )
+
+        # future predictor configs
+        self.parser.add_argument(
+            "--future_predictor.enable",
+            action="store_true",
+            default=True,
+            help="Whether to enable the future predictor head (used with future MI loss).",
+        )
+        self.parser.add_argument(
+            "--future_predictor.head_type",
+            type=str,
+            default="linear",
+            choices=["linear", "mlp", "gated"],
+            help="Architecture of the future predictor head.",
+        )
+        self.parser.add_argument(
+            "--future_predictor.dropout",
+            type=float,
+            default=0.1,
+            help="Dropout used inside the future predictor head.",
+        )
+        self.parser.add_argument(
+            "--future_predictor.lr_scale",
+            type=float,
+            default=1.0,
+            help="Learning rate scale applied only to the future predictor optimizer/group.",
+        )
+        self.parser.add_argument(
+            "--future_predictor.weight_decay",
+            type=float,
+            default=0.0,
+            help="Override weight decay for future predictor only. If None, use optimizer.weight_decay.",
         )
 
         # action layer configs

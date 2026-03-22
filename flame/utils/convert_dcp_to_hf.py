@@ -14,7 +14,7 @@ from torch.distributed.checkpoint.format_utils import dcp_to_torch_save
 from torchtitan.tools.logging import init_logger, logger
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-import custom_models
+# import custom_models
 
 
 @torch.inference_mode()

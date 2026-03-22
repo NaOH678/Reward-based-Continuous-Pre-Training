@@ -27,7 +27,7 @@ except ImportError:  # pragma: no cover - flex_attention not available on older 
     _HAS_FLEX_ATTENTION = False
 try:
     from transformers import AttentionInterface, AttentionMaskInterface
-    _HAS_FLEX_INTERFACE = False
+    _HAS_FLEX_INTERFACE = True
 except Exception:  # pragma: no cover - older transformers
     _HAS_FLEX_INTERFACE = False
 from torch.distributed.elastic.multiprocessing.errors import record
@@ -37,7 +37,6 @@ from torchtitan.components.loss import build_cross_entropy_loss
 from torchtitan.components.lr_scheduler import build_lr_schedulers
 from torchtitan.components.metrics import build_device_memory_monitor, build_metrics_processor, ensure_pp_loss_visible
 from torchtitan.components.optimizer import build_optimizers
-from torchtitan.config_manager import TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.protocols.model_converter import build_model_converters
@@ -51,55 +50,12 @@ import custom_models
 from flame.components.checkpoint import TrainState
 from flame.config_manager import JobConfig
 from flame.data import build_dataloader, build_dataset
-from flame.models.parallelize_fla import apply_ddp, apply_fsdp, parallelize_fla
+from flame.models.parallelize_fla import parallelize_fla
 from flame.models.pipeline_fla import pipeline_fla
 from flame.models.mi_estimator import build_mi_estimator
 from flame.models.future_predictor import FuturePredictorHead
 from flame.models.action_layer import ActionLayer
 from flame.tools.utils import get_nparams_and_flops
-
-
-def init_rope_inv_freq(model, device):
-    """
-    手动初始化 RoPE 的 inv_freq buffer。
-
-    这是因为 HuggingFace 模型将 inv_freq 注册为 non-persistent buffer，
-    不会保存到 checkpoint 中。当从 DCP checkpoint 加载时，post_init()
-    在 to_empty() 后无法正确初始化 inv_freq，导致 RoPE 失效。
-
-    Args:
-        model: HuggingFace 模型 (LlamaForCausalLM, OLMoForCausalLM, etc.)
-        device: 目标设备
-    """
-    config = model.config
-
-    # 获取 RoPE 参数
-    rope_theta = getattr(config, 'rope_theta', 10000.0)
-    head_dim = config.hidden_size // config.num_attention_heads
-
-    # 计算 inv_freq: 1 / (theta ^ (2i / dim))
-    inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
-    inv_freq = inv_freq.to(device)
-
-    # 找到并设置所有 rotary_emb.inv_freq buffers
-    initialized = False
-    for name, module in model.named_modules():
-        if hasattr(module, 'inv_freq') and 'rotary' in name.lower():
-            if module.inv_freq.shape == inv_freq.shape:
-                module.inv_freq.copy_(inv_freq)
-                initialized = True
-
-    # 也处理顶层 rotary_emb (如 model.model.rotary_emb)
-    if hasattr(model, 'model') and hasattr(model.model, 'rotary_emb'):
-        rotary_emb = model.model.rotary_emb
-        if hasattr(rotary_emb, 'inv_freq') and rotary_emb.inv_freq.shape == inv_freq.shape:
-            rotary_emb.inv_freq.copy_(inv_freq)
-            initialized = True
-
-    if initialized:
-        logger.info(f"Initialized RoPE inv_freq: rope_theta={rope_theta}, head_dim={head_dim}")
-    else:
-        logger.warning("Could not find inv_freq buffer to initialize - model may not use RoPE")
 
 
 def _peek_raw_sample(dataset):
@@ -169,9 +125,7 @@ def _ensure_cloudpickle_for_dist_objects():
 
 
 def build_future_attention_mask(
-    attention_mask: torch.Tensor,
-    dtype: torch.dtype,
-    window_k: int | None = None
+    attention_mask: torch.Tensor, dtype: torch.dtype
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Build a padding-aware anti-causal attention mask and a validity mask for InfoNCE.
@@ -179,159 +133,34 @@ def build_future_attention_mask(
     Args:
         attention_mask: (B, T) with 1 for valid tokens, 0 for padding.
         dtype: dtype to use for the additive mask.
-        window_k: Optional window size for future attention. If None, attend to all future tokens.
     Returns:
         future_attn_mask: (B, 1, T, T) additive mask, 0 where attending is allowed, large negative elsewhere.
         future_valid: (B, T) bool mask where at least one valid future token exists.
     """
     bsz, seqlen = attention_mask.shape
     device = attention_mask.device
-    neg_inf = -1e4
+    # Use a finite negative to avoid inf/NaN under mixed precision.
+    neg_inf = torch.tensor(-1e4, device=device, dtype=dtype)
 
-    # Create position indices
-    positions = torch.arange(seqlen, device=device)
+    # Future-only mask: allow attending to positions strictly greater than t.
+    future_only = torch.triu(
+        torch.ones((seqlen, seqlen), device=device, dtype=torch.bool), diagonal=1
+    )
+    future_mask = torch.full(
+        (1, 1, seqlen, seqlen), fill_value=neg_inf.item(), device=device, dtype=dtype
+    )
+    future_mask = future_mask.masked_fill(future_only.unsqueeze(0).unsqueeze(0), 0.0)
+    future_mask = future_mask.expand(bsz, -1, -1, -1).contiguous()
 
-    # Future-only mask: allow attending to positions strictly greater than t
-    # future_only[i, j] = True if j > i (anti-causal)
-    future_only = positions[None, :] > positions[:, None]  # [T, T]
-
-    # Apply window constraint if specified
-    if window_k is not None and window_k > 0:
-        # Also require j <= i + window_k
-        distance = positions[None, :] - positions[:, None]  # j - i
-        within_window = distance <= window_k
-        future_only = future_only & within_window
-
-    # Convert to additive mask
-    future_mask = torch.where(
-        future_only,
-        0.0,
-        neg_inf
-    ).to(dtype=dtype)  # [T, T]
-
-    # Expand to batch
-    future_mask = future_mask.unsqueeze(0).unsqueeze(0).expand(bsz, 1, seqlen, seqlen).contiguous()
-
-    # Apply padding mask
     if attention_mask is not None:
         pad_mask = (attention_mask == 0).to(dtype=dtype)
         future_mask = future_mask + pad_mask[:, None, None, :] * neg_inf
 
-    # Valid positions are non-pad tokens that have at least one future valid token
-    if window_k is not None and window_k > 0:
-        # With window constraint: check if there's a valid future token within window (vectorized)
-        positions_i = torch.arange(seqlen, device=device)[:, None]  # [T, 1]
-        positions_j = torch.arange(seqlen, device=device)[None, :]  # [1, T]
-
-        # Check if j is in range (i, i+window_k] for each i
-        in_future = positions_j > positions_i  # j > i
-        in_window = positions_j <= positions_i + window_k  # j <= i + window_k
-        in_range = in_future & in_window  # [T, T]
-
-        # For each position i in each batch, check if any j in range is valid
-        future_exists = torch.einsum('bt,st->bs', attention_mask.float(), in_range.float()) > 0  # [B, T]
-        future_valid = future_exists & attention_mask.bool()
-    else:
-        # No window constraint: valid if there's any future token
-        token_lens = attention_mask.sum(dim=1)
-        max_valid_index = torch.clamp(token_lens - 1, min=0)
-        positions_batch = torch.arange(seqlen, device=device).unsqueeze(0)
-        future_valid = (positions_batch < max_valid_index.unsqueeze(1)) & attention_mask.bool()
-
-    return future_mask, future_valid
-
-
-def build_future_mask_from_batch_cu(
-    cu_seqlens: torch.Tensor,
-    attention_mask: torch.Tensor,
-    window_k: int | None,
-    dtype: torch.dtype
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Build document-aware anti-causal attention mask from batch-level cu_seqlens.
-    Optimized version with vectorized operations.
-
-    Args:
-        cu_seqlens: (B, max_num_docs+1) with -1 padding for invalid entries.
-                    Each row contains document boundaries for one sample.
-        attention_mask: (B, T) with 1 for valid tokens, 0 for padding.
-        window_k: Optional window size for future attention. If None, attend to all future in same doc.
-        dtype: dtype to use for the additive mask.
-
-    Returns:
-        future_attn_mask: (B, 1, T, T) additive mask, 0 where attending is allowed, large negative elsewhere.
-        future_valid: (B, T) bool mask where at least one valid future token exists within same document.
-    """
-    bsz, seqlen = attention_mask.shape
-    device = attention_mask.device
-    neg_inf = -1e4
-
-    # Initialize future mask: block everything initially
-    future_mask = torch.full(
-        (bsz, 1, seqlen, seqlen),
-        fill_value=neg_inf,
-        device=device,
-        dtype=dtype
-    )
-
-    # Initialize future_valid: no valid future initially
-    future_valid = torch.zeros((bsz, seqlen), dtype=torch.bool, device=device)
-
-    # Process each sample in the batch
-    for b in range(bsz):
-        cu = cu_seqlens[b]
-        # Filter out padding (-1)
-        valid_cu = cu[cu >= 0]
-
-        if valid_cu.numel() < 2:
-            continue
-
-        # For each document in this sample
-        for doc_idx in range(len(valid_cu) - 1):
-            doc_start = int(valid_cu[doc_idx].item())
-            doc_end = int(valid_cu[doc_idx + 1].item())
-
-            if doc_start >= doc_end:
-                continue
-
-            doc_len = doc_end - doc_start
-
-            # Create anti-causal mask for this document (vectorized)
-            # Position i attends to position j where j > i within the document
-            i_idx = torch.arange(doc_len, device=device)[:, None]  # [doc_len, 1]
-            j_idx = torch.arange(doc_len, device=device)[None, :]  # [1, doc_len]
-
-            # Anti-causal: j > i
-            doc_mask = (j_idx > i_idx).to(dtype=dtype)  # [doc_len, doc_len]
-
-            # Apply window constraint if specified
-            if window_k is not None and window_k > 0:
-                distance = j_idx - i_idx
-                doc_mask = doc_mask * (distance <= window_k).to(dtype=dtype)
-
-            # Convert to additive mask: 0 where allowed, neg_inf where blocked
-            doc_mask = torch.where(doc_mask > 0, 0.0, neg_inf)
-
-            # Place into the full mask
-            future_mask[b, 0, doc_start:doc_end, doc_start:doc_end] = doc_mask
-
-            # Mark positions with valid future (vectorized)
-            if window_k is not None and window_k > 0:
-                # Position i has valid future if min(i + window_k, doc_end - 1) > i
-                positions = torch.arange(doc_start, doc_end, device=device)
-                future_end = torch.minimum(
-                    positions + window_k,
-                    torch.tensor(doc_end - 1, device=device, dtype=positions.dtype)
-                )
-                has_future = future_end > positions
-                future_valid[b, doc_start:doc_end] = has_future
-            else:
-                # All positions except the last have valid future
-                future_valid[b, doc_start:doc_end-1] = True
-
-    # Apply padding mask
-    pad_mask = (attention_mask == 0).to(dtype=dtype)
-    future_mask = future_mask + pad_mask[:, None, None, :] * neg_inf
+    # Valid positions are non-pad tokens that have at least one future valid token.
+    token_lens = attention_mask.sum(dim=1)
+    max_valid_index = torch.clamp(token_lens - 1, min=0)  # last index with a future
+    positions = torch.arange(seqlen, device=device).unsqueeze(0)
+    future_valid = (positions < max_valid_index.unsqueeze(1)) & attention_mask.bool()
 
     return future_mask, future_valid
 
@@ -466,35 +295,6 @@ def _register_future_flex_attn():
     AttentionInterface.register("future_flex", future_flex_attention_forward)
     AttentionMaskInterface.register("future_flex", future_flex_block_mask)
     _FLEX_REG_DONE = True
-
-
-def _parallelize_aux_module(module, world_mesh, parallel_dims, job_config):
-    if parallel_dims.dp_shard_enabled or parallel_dims.cp_enabled:
-        if parallel_dims.dp_replicate_enabled:
-            dp_mesh_dim_names = ("dp_replicate", "dp_shard_cp")
-        else:
-            dp_mesh_dim_names = ("dp_shard_cp",)
-        apply_fsdp(
-            module,
-            world_mesh[tuple(dp_mesh_dim_names)],
-            param_dtype=TORCH_DTYPE_MAP[job_config.training.mixed_precision_param],
-            reduce_dtype=TORCH_DTYPE_MAP[job_config.training.mixed_precision_reduce],
-            pp_enabled=parallel_dims.pp_enabled,
-            cpu_offload=job_config.training.enable_cpu_offload,
-            reshard_after_forward_policy=job_config.training.fsdp_reshard_after_forward,
-        )
-        return True
-    if parallel_dims.dp_replicate_enabled:
-        if world_mesh.ndim > 1:
-            raise RuntimeError("DDP has not supported > 1D parallelism")
-        apply_ddp(
-            module,
-            world_mesh,
-            enable_compile=job_config.training.compile,
-            enable_compiled_autograd=job_config.experimental.enable_compiled_autograd,
-        )
-        return True
-    return False
 
 def build_tokenizer(job_config: JobConfig) -> AutoTokenizer:
     return AutoTokenizer.from_pretrained(job_config.model.tokenizer_path)
@@ -634,8 +434,6 @@ def main(job_config: JobConfig):
         num_workers=job_config.training.num_workers,
         seed=job_config.training.seed,
         trust_remote_code=job_config.training.trust_remote_code,
-        seq_len=job_config.training.seq_len,
-        eos_token_id=tokenizer.eos_token_id,
     )
     dataset_size = getattr(dataset, "_flame_num_rows", None)
     if job_config.training.epochs is not None:
@@ -665,7 +463,6 @@ def main(job_config: JobConfig):
         seq_len=job_config.training.seq_len,
         context_len=job_config.training.context_len,
         varlen=job_config.training.varlen,
-        respect_doc_boundaries=job_config.future_encoder.respect_doc_boundaries,
         num_workers=job_config.training.num_workers,
         pin_memory=job_config.training.pin_memory,
         persistent_workers=job_config.training.persistent_workers,
@@ -765,9 +562,6 @@ def main(job_config: JobConfig):
             m.to_empty(device=init_device)
             with torch.no_grad():
                 m.post_init()
-                # 关键修复：手动初始化 RoPE inv_freq buffer
-                # HF 模型将 inv_freq 注册为 non-persistent buffer，不会保存到 checkpoint
-                init_rope_inv_freq(m, init_device)
             m.train()
 
         # confirm that user will be able to view loss metrics on the console
@@ -778,9 +572,6 @@ def main(job_config: JobConfig):
         model.to_empty(device=init_device)
         with torch.no_grad():
             model.post_init()
-            # 关键修复：手动初始化 RoPE inv_freq buffer
-            # HF 模型将 inv_freq 注册为 non-persistent buffer，不会保存到 checkpoint
-            init_rope_inv_freq(model, init_device)
         model.train()
 
         model_parts = [model]
@@ -800,9 +591,15 @@ def main(job_config: JobConfig):
             future_predictor.to(init_device)
             future_predictor.train()
             if len(list(future_predictor.parameters())) > 0:
-                _parallelize_aux_module(
-                    future_predictor, world_mesh, parallel_dims, job_config
-                )
+                if parallel_dims.dp_replicate_enabled:
+                    ddp_kwargs = (
+                        {"device_ids": [device.index], "output_device": device.index}
+                        if device.type == "cuda"
+                        else {}
+                    )
+                    future_predictor = DDP(
+                        future_predictor, broadcast_buffers=False, **ddp_kwargs
+                    )
                 model_parts.append(future_predictor)
 
         mi_estimator = build_mi_estimator(
@@ -813,7 +610,13 @@ def main(job_config: JobConfig):
         mi_estimator.to(init_device)
         mi_estimator.train()
         if len(list(mi_estimator.parameters())) > 0:
-            _parallelize_aux_module(mi_estimator, world_mesh, parallel_dims, job_config)
+            if parallel_dims.dp_replicate_enabled:
+                ddp_kwargs = (
+                    {"device_ids": [device.index], "output_device": device.index}
+                    if device.type == "cuda"
+                    else {}
+                )
+            mi_estimator = DDP(mi_estimator, broadcast_buffers=False, **ddp_kwargs)
             model_parts.append(mi_estimator)
 
     if job_config.action_layer.enable:
@@ -849,7 +652,13 @@ def main(job_config: JobConfig):
         action_layer.to(init_device)
         action_layer.train()
         if len(list(action_layer.parameters())) > 0:
-            _parallelize_aux_module(action_layer, world_mesh, parallel_dims, job_config)
+            if parallel_dims.dp_replicate_enabled:
+                ddp_kwargs = (
+                    {"device_ids": [device.index], "output_device": device.index}
+                    if device.type == "cuda"
+                    else {}
+                )
+                action_layer = DDP(action_layer, broadcast_buffers=False, **ddp_kwargs)
             model_parts.append(action_layer)
 
     device_mem_stats = device_memory_monitor.get_peak_stats()
@@ -872,27 +681,6 @@ def main(job_config: JobConfig):
         else model_parts
     )
     optimizers = train_spec.build_optimizers_fn(optim_model_parts, job_config, ft_manager)
-
-    # Optionally scale LR / override weight decay for the future predictor only.
-    fp_lr_scale = getattr(job_config.future_predictor, "lr_scale", 1.0)
-    fp_wd_override = getattr(job_config.future_predictor, "weight_decay", None)
-    if future_predictor is not None and hasattr(optimizers, "optimizers"):
-        try:
-            fp_idx = model_parts.index(future_predictor)
-            fp_optim = optimizers.optimizers[fp_idx]
-            for pg in fp_optim.param_groups:
-                if fp_lr_scale != 1.0:
-                    pg["lr"] = pg["lr"] * fp_lr_scale
-                if fp_wd_override is not None:
-                    pg["weight_decay"] = fp_wd_override
-            logger.info(
-                f"Applied lr_scale={fp_lr_scale} "
-                f"{'and weight_decay='+str(fp_wd_override) if fp_wd_override is not None else ''} "
-                "to future_predictor optimizer"
-            )
-        except Exception as exc:  # pragma: no cover - defensive fallback
-            logger.warning(f"Failed to apply lr/wd override to future_predictor: {exc}")
-
     lr_schedulers = train_spec.build_lr_schedulers_fn(optimizers, job_config)
     # Post optimizer step model converters hook.
     # e.g. calculate float8 dynamic amax/scale for all-parameter for FSDP2
@@ -1066,16 +854,12 @@ def main(job_config: JobConfig):
                     attention_mask = attention_mask.to(dtype=torch.bool)
                 cu_seqlens = (
                     batch["cu_seqlens"].to(device_type)
-                    if "cu_seqlens" in batch and batch["cu_seqlens"] is not None
+                    if "cu_seqlens" in batch
                     else None
                 )
-                # Handle position_ids based on cu_seqlens format
-                if cu_seqlens is not None and cu_seqlens.dim() == 1:
-                    # Varlen mode: cu_seqlens is 1D, use prepare_position_ids
+                if cu_seqlens is not None:
                     position_ids = prepare_position_ids(cu_seqlens).to(torch.int32)
                 else:
-                    # Non-varlen mode (batch-level cu_seqlens is 2D) or no cu_seqlens
-                    # Use standard sequential position_ids for each batch element
                     position_ids = (
                         torch.arange(0, input_ids.shape[1], device=device_type)
                         .repeat(input_ids.shape[0], 1)
@@ -1217,7 +1001,7 @@ def main(job_config: JobConfig):
                                         dtype=torch.bool,
                                         device=hidden_states.device,
                                     )
-                            elif cu_seqlens is not None and cu_seqlens.dim() == 1:
+                            elif cu_seqlens is not None:
                                 # Fallback dense future mask for varlen
                                 future_mask, future_valid = build_future_mask_from_cu(
                                     cu_seqlens,
@@ -1249,23 +1033,10 @@ def main(job_config: JobConfig):
                                         future_output = model(**future_forward_kwargs)
                                         future_summaries_detached = future_output.hidden_states[-1].detach()
                             elif attention_mask is not None:
-                                # Non-varlen path: check if we should use document-aware mask
-                                respect_doc_boundaries = job_config.future_encoder.respect_doc_boundaries
-                                if respect_doc_boundaries and cu_seqlens is not None and cu_seqlens.dim() == 2:
-                                    # Use document-aware future mask based on EOS tokens
-                                    future_attn_mask, future_valid = build_future_mask_from_batch_cu(
-                                        cu_seqlens=cu_seqlens,
-                                        attention_mask=attention_mask,
-                                        window_k=future_window_k if future_window_k != 0 else None,
-                                        dtype=torch.float32
-                                    )
-                                else:
-                                    # Fallback: simple future mask without document boundaries
-                                    future_attn_mask, future_valid = build_future_attention_mask(
-                                        attention_mask=attention_mask,
-                                        dtype=torch.float32,
-                                        window_k=future_window_k if future_window_k != 0 else None
-                                    )
+                                # Non-varlen path: dense padding-aware future mask.
+                                future_attn_mask, future_valid = build_future_attention_mask(
+                                    attention_mask, dtype=labels.dtype
+                                )
                                 with torch.no_grad():
                                     future_output = model(
                                         input_ids=input_ids,
@@ -1277,37 +1048,13 @@ def main(job_config: JobConfig):
                                     future_summaries_detached = future_output.hidden_states[-1].detach()
                             if future_valid is not None and future_predictor is not None and mi_estimator is not None:
                                 hidden_states = output.hidden_states[-1]
-                                # Align targets to future positions (t -> t+k) to avoid using the current token's residual.
-                                shift_k = max(1, getattr(job_config.future_encoder, "shift_k", 1))
-                                if shift_k > 1:
-                                    # Sample a random shift in [1, shift_k] each step to increase difficulty/diversity.
-                                    shift = int(torch.randint(1, shift_k + 1, (1,), device=hidden_states.device).item())
-                                else:
-                                    shift = 1
-                                if hidden_states.size(1) > shift:
-                                    predicted_future = future_predictor(hidden_states[:, :-shift, :])
-                                    future_target = future_summaries_detached[:, shift:, :]
-                                    future_valid_shifted = future_valid[:, :-shift] if future_valid is not None else None
-                                    aux_loss = mi_estimator(
-                                        predicted_future,
-                                        future_target,
-                                        valid_mask=future_valid_shifted,
-                                    )
-                                    aux_loss_scaled = (
-                                        aux_loss
-                                        * inv_grad_acc_steps
-                                        * job_config.future_encoder.loss_weight
-                                    )
-                                else:
-                                    aux_loss = torch.tensor(0.0, device=device)
-                                    aux_loss_scaled = torch.tensor(0.0, device=device)
-                                if metric_logger.should_log(train_state.step) and dist.get_rank() == 0:
-                                    valid_tokens = future_valid.sum().item() if future_valid is not None else 0
-                                    logger.info(
-                                        f"raw_aux={aux_loss.item():.4f}, scaled={aux_loss_scaled.item():.4f}, "
-                                        f"valid_tokens={valid_tokens}"
-                                        f' log(valid_count) * (1/grad_acc_steps) * loss_weight={math.log(valid_tokens) * inv_grad_acc_steps * job_config.future_encoder.loss_weight if valid_tokens > 0 else 0.0}'
-                                    )
+                                predicted_future = future_predictor(hidden_states)
+                                aux_loss = mi_estimator(predicted_future, future_summaries_detached, valid_mask=future_valid)
+                                aux_loss_scaled = (
+                                    aux_loss
+                                    * inv_grad_acc_steps
+                                    * job_config.future_encoder.loss_weight
+                                )
                         total_loss = total_loss + aux_loss_scaled
 
                         if action_layer is not None:
@@ -1481,15 +1228,6 @@ def main(job_config: JobConfig):
                     "optimizer/grad_norm": grad_norm.item(),
                     "optimizer/skipped_step": train_state.skipped_step,
                 }
-                # Log future predictor lr if available (to reflect lr_scale / warmup overrides).
-                if future_predictor is not None and hasattr(optimizers, "optimizers"):
-                    try:
-                        fp_idx = model_parts.index(future_predictor)
-                        fp_optim = optimizers.optimizers[fp_idx]
-                        fp_lr = fp_optim.param_groups[0]["lr"]
-                        extra_metrics["optimizer/lr_future_pred"] = fp_lr
-                    except Exception:
-                        pass
 
                 if job_config.future_encoder.enable:
                     extra_metrics["aux_loss"] = global_avg_aux_loss

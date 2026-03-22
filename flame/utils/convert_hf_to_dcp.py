@@ -14,6 +14,7 @@ import fla  # noqa
 from torchtitan.tools.logging import init_logger, logger
 from flame.models.future_encoder import FutureEncoder
 from flame.models.action_layer import ActionLayer
+from flame.models.future_predictor import FuturePredictorHead
 
 
 @torch.inference_mode()
@@ -24,6 +25,9 @@ def convert_hf_weights(
     include_future_encoder: bool = False,
     future_k: int = 4,
     future_summary_method: str = "mean",
+    include_future_predictor: bool = False,
+    future_predictor_head_type: str = "linear",
+    future_predictor_dropout: float = 0.1,
     include_action_layer: bool = False,
     action_head_type: str = "mlp",
     action_use_rms_norm: bool = False,
@@ -56,6 +60,24 @@ def convert_hf_weights(
         )
         state_dict.update(future_encoder.state_dict())
         logger.info("FutureEncoder parameters added to checkpoint.")
+
+    if include_future_predictor:
+        if not include_future_encoder:
+            logger.warning(
+                "Including FuturePredictor without FutureEncoder; ensure future summaries are available during training."
+            )
+        logger.info(
+            "Including FuturePredictor parameters (head_type=%s, dropout=%s)",
+            future_predictor_head_type,
+            future_predictor_dropout,
+        )
+        future_predictor = FuturePredictorHead(
+            hidden_size=model.config.hidden_size,
+            head_type=future_predictor_head_type,
+            dropout=future_predictor_dropout,
+        )
+        state_dict.update(future_predictor.state_dict())
+        logger.info("FuturePredictor parameters added to checkpoint.")
 
     if include_action_layer:
         if not include_future_encoder:
@@ -109,6 +131,24 @@ if __name__ == "__main__":
         help="FutureEncoder summary_method when --include_future_encoder is enabled.",
     )
     parser.add_argument(
+        "--include_future_predictor",
+        action="store_true",
+        help="If set, initialize and save a FuturePredictorHead state_dict alongside the base model.",
+    )
+    parser.add_argument(
+        "--future_predictor_head_type",
+        type=str,
+        default="linear",
+        choices=["linear", "mlp", "gated"],
+        help="Head type for FuturePredictor when --include_future_predictor is enabled.",
+    )
+    parser.add_argument(
+        "--future_predictor_dropout",
+        type=float,
+        default=0.1,
+        help="Dropout rate for FuturePredictor when --include_future_predictor is enabled.",
+    )
+    parser.add_argument(
         "--include_action_layer",
         action="store_true",
         help="If set, initialize and save an ActionLayer state_dict alongside the base model.",
@@ -140,6 +180,9 @@ if __name__ == "__main__":
         include_future_encoder=args.include_future_encoder,
         future_k=args.future_k,
         future_summary_method=args.future_summary_method,
+        include_future_predictor=args.include_future_predictor,
+        future_predictor_head_type=args.future_predictor_head_type,
+        future_predictor_dropout=args.future_predictor_dropout,
         include_action_layer=args.include_action_layer,
         action_head_type=args.action_head_type,
         action_use_rms_norm=args.action_use_rms_norm,

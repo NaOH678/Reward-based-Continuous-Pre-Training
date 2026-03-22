@@ -8,9 +8,18 @@ data
 avataRL
 3rdparty
 lm-evaluation-harness
+check_future_mask.py
+flame_origin
+OLMo
+OLMo*
+dolmino-50B
+omni-math 
 # shell scripts
 *.sh
+*.pdf
+*.jpg
 
+result_all*
 # docs
 docs/_build
 
