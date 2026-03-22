@@ -1,5 +1,6 @@
 ```bash
-[rank0]:RuntimeError: aten._foreach_norm.Scalar: got mixed torch.Tensor and DTensor, need to convert all torch.Tensor to DTensor before calling distributed operators!
+[rank0]:RuntimeError: aten._foreach_norm.Scalar: got mixed torch.Tensor and DTensor,
+need to convert all torch.Tensor to DTensor before calling distributed operators!
 ```
 
 
